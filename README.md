@@ -1,0 +1,2 @@
+# disctui
+Discord TUI
