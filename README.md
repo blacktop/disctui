@@ -59,6 +59,17 @@ cargo build --release --features experimental-discord
 ./target/release/disctui
 ```
 
+### Dev Shortcuts
+
+This repo includes a `justfile` for common workflows:
+
+```sh
+just build
+just check
+just bump-patch
+just dist-build
+```
+
 ## Auth
 
 `disctui` resolves your Discord token in this order:
@@ -91,6 +102,8 @@ Config file search order:
 
 - macOS: `~/Library/Application Support/disctui/config.toml`
 - XDG-style fallback: `~/.config/disctui/config.toml`
+
+Start from [`config.toml.example`](./config.toml.example).
 
 Current config keys include:
 

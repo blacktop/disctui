@@ -1,0 +1,28 @@
+# disctui config example
+#
+# Search order:
+#   1. ~/Library/Application Support/disctui/config.toml
+#   2. ~/.config/disctui/config.toml
+#   3. --config /path/to/config.toml
+#
+# Discord auth is not read from this file.
+# Use DISCTUI_TOKEN or the startup Keychain-backed token prompt instead.
+
+# UI tick cadence in milliseconds.
+tick_rate_ms = 250
+
+# Enable mouse support in the TUI.
+mouse = false
+
+# AI summary backend:
+#   auto   = prefer Anthropic env var, otherwise configured local endpoint
+#   claude = Anthropic API key from ANTHROPIC_API_KEY
+#   local  = OpenAI-compatible local endpoint
+#   none   = disable summaries
+ai_backend = "auto"
+
+# Used when ai_backend = "local", or as the auto-mode local fallback.
+# ai_base_url = "http://localhost:1234/v1"
+
+# Optional model override for the selected AI backend.
+# ai_model = "google/gemma-4-26b-a4b"
