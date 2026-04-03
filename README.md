@@ -1,2 +1,3 @@
 # disctui
-Discord TUI
+
+> Discord TUI
