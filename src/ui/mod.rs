@@ -32,23 +32,29 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Header breadcrumb: Guild > #channel
     render_header(frame, header_area, app);
 
+    let guild_pane_loading_bar = app.guild_pane_loading_bar();
+    let selected_guild_muted = app.selected_guild_muted();
+    let channels_pane_loading_bar = app.channels_pane_loading_bar();
+    let messages_pane_loading_bar = app.messages_pane_loading_bar();
+
     guilds::render(
         frame,
         guild_area,
         &app.guilds,
         &mut app.guild_state,
         app.focus == FocusPane::Guilds,
+        guild_pane_loading_bar.as_deref(),
         app.selected_guild_id.as_deref(),
         &mut app.avatars,
     );
 
-    let selected_guild_muted = app.selected_guild_muted();
     channels::render(
         frame,
         channel_area,
         &app.channels,
         &mut app.channel_state,
         app.focus == FocusPane::Channels,
+        channels_pane_loading_bar.as_deref(),
         selected_guild_muted,
         app.selected_channel_id.as_deref(),
     );
@@ -65,6 +71,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 } else {
                     app.message_scroll_offset
                 },
+                messages_pane_loading_bar.as_deref(),
                 app.focus == FocusPane::Messages,
                 &mut app.avatars,
             );
@@ -97,10 +104,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     status_bar::render(
         frame,
         status_area,
-        app.input_mode,
         app.focus,
         app.connection_state,
         app.selected_channel_name().zip(app.selected_channel_kind()),
+        app.active_load_label().zip(app.active_load_progress_bar()),
         app.status_error(),
     );
 
@@ -157,7 +164,7 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     };
 
     let line = if guild.is_empty() && channel.is_empty() {
-        Line::from(Span::styled(" disctui", theme::dim()))
+        Line::from(Span::styled(" disctui", theme::title()))
     } else if channel.is_empty() {
         Line::from(vec![
             Span::raw(" "),
@@ -176,8 +183,7 @@ fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     };
 
     frame.render_widget(
-        Paragraph::new(line)
-            .style(ratatui::style::Style::new().bg(ratatui::style::Color::Rgb(30, 31, 36))),
+        Paragraph::new(line).style(ratatui::style::Style::new().bg(theme::DISCORD_BG_DARK)),
         area,
     );
 }

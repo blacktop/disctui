@@ -4,9 +4,9 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::Paragraph;
-use ratatui_image::StatefulImage;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::{Resize, StatefulImage};
 
 #[derive(Debug, Clone, Copy)]
 pub enum ImageSupport {
@@ -31,8 +31,17 @@ impl ImageSupport {
 )]
 enum AvatarStatus {
     Pending,
-    Ready(StatefulProtocol),
+    Ready {
+        color: StatefulProtocol,
+        muted: StatefulProtocol,
+    },
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AvatarTone {
+    FullColor,
+    Muted,
 }
 
 pub struct AvatarStore {
@@ -89,8 +98,10 @@ impl AvatarStore {
         self.inflight.remove(&url);
         match image::load_from_memory(&bytes) {
             Ok(image) => {
-                let protocol = self.picker.new_resize_protocol(image);
-                self.cache.insert(url, AvatarStatus::Ready(protocol));
+                let muted_image = image.grayscale();
+                let color = self.picker.new_resize_protocol(image);
+                let muted = self.picker.new_resize_protocol(muted_image);
+                self.cache.insert(url, AvatarStatus::Ready { color, muted });
             }
             Err(_) => {
                 self.cache.insert(url, AvatarStatus::Failed);
@@ -110,58 +121,95 @@ impl AvatarStore {
         url: Option<&str>,
         fallback_label: &str,
         fallback_color: ratatui::style::Color,
+        tone: AvatarTone,
     ) {
         let Some(url) = url else {
-            render_fallback(frame, area, fallback_label, fallback_color);
+            render_fallback(frame, area, fallback_label, fallback_color, tone);
             return;
         };
 
         match self.cache.get_mut(url) {
-            Some(AvatarStatus::Ready(protocol)) => {
-                frame.render_stateful_widget(StatefulImage::new(), area, protocol);
+            Some(AvatarStatus::Ready { color, muted }) => {
+                let protocol = match tone {
+                    AvatarTone::FullColor => color,
+                    AvatarTone::Muted => muted,
+                };
+                let render_area = centered_render_area(protocol, area);
+                frame.render_stateful_widget(
+                    StatefulImage::new().resize(Resize::Fit(None)),
+                    render_area,
+                    protocol,
+                );
             }
             Some(AvatarStatus::Pending) => {
-                render_fallback(frame, area, "··", fallback_color);
+                render_fallback(frame, area, "··", fallback_color, tone);
             }
             Some(AvatarStatus::Failed) | None => {
-                render_fallback(frame, area, fallback_label, fallback_color);
+                render_fallback(frame, area, fallback_label, fallback_color, tone);
             }
         }
     }
 }
 
-fn render_fallback(frame: &mut Frame, area: Rect, label: &str, color: ratatui::style::Color) {
+fn centered_render_area(protocol: &StatefulProtocol, area: Rect) -> Rect {
+    let fitted = protocol.size_for(Resize::Fit(None), area);
+    let width = fitted.width.min(area.width);
+    let height = fitted.height.min(area.height);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    let y = area.y + area.height.saturating_sub(height) / 2;
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+fn render_fallback(
+    frame: &mut Frame,
+    area: Rect,
+    label: &str,
+    color: ratatui::style::Color,
+    tone: AvatarTone,
+) {
     use ratatui::style::{Modifier, Style};
     use ratatui::text::Span;
 
-    // Colored background with white bold initials — mimics Discord's default avatar style
-    let style = Style::new()
-        .fg(ratatui::style::Color::White)
-        .bg(color)
-        .add_modifier(Modifier::BOLD);
+    let foreground = match tone {
+        AvatarTone::FullColor => color,
+        AvatarTone::Muted => desaturate_color(color),
+    };
 
-    // Center the label vertically in the area
+    let style = Style::new().fg(foreground).add_modifier(Modifier::BOLD);
+
     let lines: Vec<Line> = (0..area.height)
         .map(|row| {
             if row == area.height / 2 {
-                // Center text in the middle row
                 let label_width = u16::try_from(label.len()).unwrap_or(area.width);
                 let pad = area.width.saturating_sub(label_width) / 2;
                 let padded = format!("{:>width$}{label}", "", width = pad as usize);
                 let filled = format!("{padded:<width$}", width = area.width as usize);
                 Line::from(Span::styled(filled, style))
             } else {
-                // Fill row with background color
-                Line::from(Span::styled(
-                    " ".repeat(area.width as usize),
-                    Style::new().bg(color),
-                ))
+                Line::from(" ".repeat(area.width as usize))
             }
         })
         .collect();
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, area);
+}
+
+fn desaturate_color(color: ratatui::style::Color) -> ratatui::style::Color {
+    match color {
+        ratatui::style::Color::Rgb(r, g, b) => {
+            let gray = ((u32::from(r) * 299) + (u32::from(g) * 587) + (u32::from(b) * 114)) / 1000;
+            let gray = u8::try_from(gray).unwrap_or(u8::MAX);
+            ratatui::style::Color::Rgb(gray, gray, gray)
+        }
+        ratatui::style::Color::Indexed(index) => ratatui::style::Color::Indexed(index),
+        _ => ratatui::style::Color::DarkGray,
+    }
 }
 
 pub fn badge_from_name(name: &str) -> String {

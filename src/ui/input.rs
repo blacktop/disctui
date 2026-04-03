@@ -15,7 +15,7 @@ pub fn render(frame: &mut Frame, area: Rect, input_text: &str, mode: InputMode, 
     };
 
     let mode_hint = match mode {
-        InputMode::Insert => " INSERT ",
+        InputMode::Insert => " Reply ",
         InputMode::Normal => "",
     };
 
@@ -31,7 +31,7 @@ pub fn render(frame: &mut Frame, area: Rect, input_text: &str, mode: InputMode, 
         Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
-            .title(mode_hint.bold().green()),
+            .title(ratatui::text::Span::styled(mode_hint, theme::title())),
     );
 
     frame.render_widget(paragraph, area);

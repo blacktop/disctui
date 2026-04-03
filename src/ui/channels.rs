@@ -8,12 +8,17 @@ use crate::model::{ChannelKind, ChannelSummary};
 use crate::ui::theme;
 use crate::ui::truncate_name;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "top-level pane renderer takes explicit widget state and loading context"
+)]
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     channels: &[ChannelSummary],
     state: &mut ListState,
     focused: bool,
+    loading_bar: Option<&str>,
     guild_muted: bool,
     selected_channel_id: Option<&str>,
 ) {
@@ -79,9 +84,30 @@ pub fn render(
         .iter()
         .filter(|channel| channel.kind.is_selectable())
         .count();
-    let title = match selected_channel_id.and_then(|id| channels.iter().find(|ch| ch.id == id)) {
+    let title = title(channels, selected_channel_id, loading_bar, selectable_count);
+
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title(Span::styled(title, theme::title())),
+        )
+        .highlight_style(theme::selected_item())
+        .highlight_symbol("> ");
+
+    frame.render_stateful_widget(list, area, state);
+}
+
+fn title(
+    channels: &[ChannelSummary],
+    selected_channel_id: Option<&str>,
+    loading_bar: Option<&str>,
+    selectable_count: usize,
+) -> String {
+    match selected_channel_id.and_then(|id| channels.iter().find(|ch| ch.id == id)) {
         Some(selected) => format!(
-            " Channels {} · {}{}{} ",
+            " Channels {} · {}{}{}{} ",
             selectable_count,
             selected.kind.marker(),
             truncate_name(&selected.name, 16),
@@ -89,20 +115,38 @@ pub fn render(
                 format!(" {}", theme::MUTE_GLYPH)
             } else {
                 String::new()
-            }
+            },
+            loading_bar.map_or_else(String::new, |bar| format!(" {bar}"))
         ),
-        None => format!(" Channels {selectable_count} "),
-    };
+        None => format!(
+            " Channels {selectable_count}{} ",
+            loading_bar.map_or_else(String::new, |bar| format!(" {bar}"))
+        ),
+    }
+}
 
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title(title.bold().cyan()),
-        )
-        .highlight_style(theme::selected_item())
-        .highlight_symbol("> ");
+#[cfg(test)]
+mod tests {
+    use crate::model::{ChannelKind, ChannelSummary};
 
-    frame.render_stateful_widget(list, area, state);
+    #[test]
+    fn title_composes_mute_and_loading_suffixes() {
+        let channels = vec![ChannelSummary {
+            id: "c1".into(),
+            guild_id: Some("g1".into()),
+            parent_id: None,
+            name: "general".into(),
+            kind: ChannelKind::Text,
+            position: 0,
+            muted: true,
+            unread: false,
+            unread_count: 0,
+            last_message_id: None,
+        }];
+
+        let title = super::title(&channels, Some("c1"), Some("▱▰▰▱"), 1);
+        assert!(title.contains("general"));
+        assert!(title.contains(super::theme::MUTE_GLYPH));
+        assert!(title.contains("▱▰▰▱"));
+    }
 }

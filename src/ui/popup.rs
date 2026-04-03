@@ -16,31 +16,76 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
     frame.render_widget(Clear, popup_area);
 
     let help_lines = vec![
-        Line::from(" Keybindings ".bold().cyan()),
+        Line::from(Span::styled(" Keybindings ", theme::title())),
         Line::raw(""),
-        Line::from(vec![" q         ".bold().cyan(), "Quit".dim()]),
-        Line::from(vec![" ?         ".bold().cyan(), "Toggle help".dim()]),
         Line::from(vec![
-            " 1/2/3     ".bold().cyan(),
+            Span::styled(" q         ", theme::selected_item()),
+            "Quit".dim(),
+        ]),
+        Line::from(vec![
+            Span::styled(" ?         ", theme::selected_item()),
+            "Toggle help".dim(),
+        ]),
+        Line::from(vec![
+            Span::styled(" 1/2/3     ", theme::selected_item()),
             "Focus guilds/channels/messages".dim(),
         ]),
-        Line::from(vec![" Tab       ".bold().cyan(), "Next pane".dim()]),
-        Line::from(vec![" Shift+Tab ".bold().cyan(), "Previous pane".dim()]),
         Line::from(vec![
-            " ← / →     ".bold().cyan(),
+            Span::styled(" Tab       ", theme::selected_item()),
+            "Next pane".dim(),
+        ]),
+        Line::from(vec![
+            Span::styled(" Shift+Tab ", theme::selected_item()),
+            "Previous pane".dim(),
+        ]),
+        Line::from(vec![
+            Span::styled(" ← / →     ", theme::selected_item()),
             "Cycle left/right panels".dim(),
         ]),
-        Line::from(vec![" j / Down  ".bold().cyan(), "Move down".dim()]),
-        Line::from(vec![" k / Up    ".bold().cyan(), "Move up".dim()]),
-        Line::from(vec![" g         ".bold().cyan(), "Jump to top".dim()]),
-        Line::from(vec![" G         ".bold().cyan(), "Jump to bottom".dim()]),
-        Line::from(vec![" Enter     ".bold().cyan(), "Select / open".dim()]),
-        Line::from(vec![" i         ".bold().cyan(), "Enter insert mode".dim()]),
-        Line::from(vec![" Esc       ".bold().cyan(), "Exit insert mode".dim()]),
-        Line::from(vec![" s         ".bold().cyan(), "Summarize unread".dim()]),
-        Line::from(vec![" R         ".bold().cyan(), "Mark all read".dim()]),
-        Line::from(vec![" m         ".bold().cyan(), "Show messages".dim()]),
-        Line::from(vec![" Ctrl+C    ".bold().cyan(), "Force quit".dim()]),
+        Line::from(vec![
+            Span::styled(" j / Down  ", theme::selected_item()),
+            "Move down".dim(),
+        ]),
+        Line::from(vec![
+            Span::styled(" k / Up    ", theme::selected_item()),
+            "Move up".dim(),
+        ]),
+        Line::from(vec![
+            Span::styled(" g         ", theme::selected_item()),
+            "Jump to top".dim(),
+        ]),
+        Line::from(vec![
+            Span::styled(" G         ", theme::selected_item()),
+            "Jump to bottom".dim(),
+        ]),
+        Line::from(vec![
+            Span::styled(" Enter     ", theme::selected_item()),
+            "Select / open".dim(),
+        ]),
+        Line::from(vec![
+            Span::styled(" i         ", theme::selected_item()),
+            "Enter insert mode".dim(),
+        ]),
+        Line::from(vec![
+            Span::styled(" Esc       ", theme::selected_item()),
+            "Exit insert mode".dim(),
+        ]),
+        Line::from(vec![
+            Span::styled(" s         ", theme::selected_item()),
+            "Summarize unread".dim(),
+        ]),
+        Line::from(vec![
+            Span::styled(" R         ", theme::selected_item()),
+            "Mark all read".dim(),
+        ]),
+        Line::from(vec![
+            Span::styled(" m         ", theme::selected_item()),
+            "Show messages".dim(),
+        ]),
+        Line::from(vec![
+            Span::styled(" Ctrl+C    ", theme::selected_item()),
+            "Force quit".dim(),
+        ]),
     ];
 
     let paragraph = Paragraph::new(help_lines)
@@ -48,7 +93,7 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(theme::focused_border())
-                .title(" Help ".bold().cyan()),
+                .title(Span::styled(" Help ", theme::title())),
         )
         .wrap(Wrap { trim: false });
 
@@ -71,12 +116,15 @@ pub fn render_discord_token_prompt(
     };
 
     let mut lines = vec![
-        Line::from(" Discord Token ".bold().cyan()),
+        Line::from(Span::styled(" Discord Token ", theme::title())),
         Line::raw(""),
         Line::from("No token found in DISCTUI_TOKEN or the macOS Keychain.".dim()),
         Line::from("Enter your Discord user token to store it in Keychain and connect.".dim()),
         Line::raw(""),
-        Line::from(vec![" Token: ".bold().cyan(), Span::raw(masked_input)]),
+        Line::from(vec![
+            Span::styled(" Token: ", theme::selected_item()),
+            Span::raw(masked_input),
+        ]),
         Line::raw(""),
         Line::from("Enter: save to Keychain and connect".dim()),
         Line::from("Esc: continue in mock mode".dim()),
@@ -92,7 +140,7 @@ pub fn render_discord_token_prompt(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(theme::focused_border())
-                .title(" Setup ".bold().cyan()),
+                .title(Span::styled(" Setup ", theme::title())),
         )
         .wrap(Wrap { trim: false });
 

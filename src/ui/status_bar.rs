@@ -3,23 +3,20 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use crate::app::{ConnectionState, FocusPane, InputMode};
+use crate::app::{ConnectionState, FocusPane};
 use crate::model::ChannelKind;
 use crate::ui::theme;
 
 pub fn render(
     frame: &mut Frame,
     area: Rect,
-    mode: InputMode,
     focus: FocusPane,
     connection: ConnectionState,
     selected_channel: Option<(&str, ChannelKind)>,
+    active_load: Option<(&str, String)>,
     error_msg: Option<&str>,
 ) {
-    let mode_span = match mode {
-        InputMode::Normal => Span::styled(" NORMAL ", theme::mode_normal()),
-        InputMode::Insert => Span::styled(" INSERT ", theme::mode_insert()),
-    };
+    let app_span = Span::styled(" DISCTUI ", theme::app_badge());
 
     let conn_span = match connection {
         ConnectionState::Connected => Span::styled(" \u{25cf} Connected ", theme::status_bar()),
@@ -46,15 +43,22 @@ pub fn render(
 
     let hints = Span::styled(" q:quit  ?:help  Tab:focus  i:insert ", theme::dim());
 
-    let mut spans = vec![
-        mode_span,
-        Span::raw(" "),
-        conn_span,
+    let mut spans = vec![app_span, Span::raw(" "), conn_span];
+
+    if let Some((label, bar)) = active_load {
+        spans.push(Span::raw("\u{2502}"));
+        if !(label == "Connecting" && connection == ConnectionState::Connecting) {
+            spans.push(Span::styled(format!(" {label} "), theme::status_bar()));
+        }
+        spans.push(Span::styled(format!(" {bar} "), theme::mention()));
+    }
+
+    spans.extend([
         Span::raw("\u{2502}"),
         focus_span,
         Span::raw("\u{2502}"),
         channel_span,
-    ];
+    ]);
 
     if let Some(err) = error_msg {
         spans.push(Span::raw(" "));

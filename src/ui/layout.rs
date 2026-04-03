@@ -57,9 +57,9 @@ fn pane_widths(total_width: u16, focus: FocusPane, has_selected_channel: bool) -
         u16,
     ) = match (focus, has_selected_channel) {
         (FocusPane::Guilds, _) => (28, 24, 18, 30, 18, 28, 34),
-        (FocusPane::Channels, _) => (16, 30, 12, 22, 20, 34, 34),
-        (FocusPane::Messages | FocusPane::Input, true) => (12, 18, 10, 16, 14, 24, 44),
-        _ => (16, 24, 12, 20, 18, 28, 36),
+        (FocusPane::Channels, _) => (8, 30, 7, 9, 20, 34, 34),
+        (FocusPane::Messages | FocusPane::Input, true) => (8, 18, 7, 9, 14, 24, 44),
+        _ => (12, 24, 10, 16, 18, 28, 36),
     };
 
     let mut guild =

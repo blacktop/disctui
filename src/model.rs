@@ -63,6 +63,34 @@ impl ChannelSummary {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LoadScope {
+    StartupConnect,
+    GuildBootstrap,
+    ChannelList(String),
+    History(String),
+}
+
+impl LoadScope {
+    pub const fn display_priority(&self) -> u8 {
+        match self {
+            Self::History(_) => 4,
+            Self::ChannelList(_) => 3,
+            Self::GuildBootstrap => 2,
+            Self::StartupConnect => 1,
+        }
+    }
+
+    pub const fn status_label(&self) -> &'static str {
+        match self {
+            Self::StartupConnect => "Connecting",
+            Self::GuildBootstrap => "Loading guilds",
+            Self::ChannelList(_) => "Loading channels",
+            Self::History(_) => "Refreshing history",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct GuildMuteSettings {
     pub guild_id: String,

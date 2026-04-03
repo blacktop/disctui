@@ -1,12 +1,12 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use textwrap::wrap;
 
 use crate::model::MessageRow;
-use crate::ui::media::{AvatarStore, badge_from_name};
+use crate::ui::media::{AvatarStore, AvatarTone, badge_from_name};
 use crate::ui::theme;
 
 const AVATAR_GUTTER_WIDTH: u16 = 6;
@@ -39,6 +39,7 @@ pub fn render(
     area: Rect,
     messages: &[MessageRow],
     scroll_offset: u16,
+    loading_bar: Option<&str>,
     focused: bool,
     avatars: &mut AvatarStore,
 ) -> u16 {
@@ -50,7 +51,13 @@ pub fn render(
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border_style)
-        .title(" Messages ".bold().cyan());
+        .title(Span::styled(
+            loading_bar.map_or_else(
+                || " Messages ".to_string(),
+                |bar| format!(" Messages {bar} "),
+            ),
+            theme::title(),
+        ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -293,6 +300,7 @@ fn render_avatars(
             marker.url.as_deref(),
             &marker.fallback,
             marker.fallback_color,
+            AvatarTone::FullColor,
         );
     }
 }
@@ -325,6 +333,7 @@ fn render_images(
             Some(&marker.url),
             &badge_from_name(&marker.filename),
             Color::DarkGray,
+            AvatarTone::FullColor,
         );
     }
 }

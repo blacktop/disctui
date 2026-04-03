@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use crate::app::FocusPane;
-use crate::model::{ChannelDigest, ChannelSummary, GuildMuteSettings, GuildSummary, MessageRow};
+use crate::model::{
+    ChannelDigest, ChannelSummary, GuildMuteSettings, GuildSummary, LoadScope, MessageRow,
+};
 
 #[derive(Debug, Clone)]
 #[expect(
@@ -27,6 +29,11 @@ pub enum Action {
     ScrollUp(u16),
     ScrollDown(u16),
     OpenSelected,
+    LoadStarted(LoadScope),
+    LoadFailed {
+        scope: LoadScope,
+        message: String,
+    },
     EnterInsert,
     ExitInsert,
     ToggleHelp,

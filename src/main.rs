@@ -32,8 +32,10 @@ use crate::app::ConnectionState;
 use crate::app::{App, InputMode};
 use crate::config::AppConfig;
 use crate::effect::Effect;
+#[cfg(not(feature = "experimental-discord"))]
+use crate::model::LoadScope;
 #[cfg(feature = "experimental-discord")]
-use crate::model::DIRECT_MESSAGES_GUILD_ID;
+use crate::model::{DIRECT_MESSAGES_GUILD_ID, LoadScope};
 use crate::transport::mock;
 
 const ACTION_CHANNEL_CAPACITY: usize = 512;
@@ -106,6 +108,7 @@ async fn run(
     match auth::get_token() {
         Ok(token) => match connect_discord_with_token(&token, &action_tx) {
             Ok(state) => {
+                app.start_load_scope(LoadScope::StartupConnect);
                 discord = Some(state);
                 app.connection_state = ConnectionState::Connecting;
                 transport_started = true;
@@ -245,6 +248,7 @@ fn execute_effect_mock(
     match effect {
         Effect::LoadGuilds => {
             let tx = tx.clone();
+            let _ = tx.try_send(Action::LoadStarted(LoadScope::GuildBootstrap));
             let guilds = mock::guilds();
             tokio::spawn(async move {
                 let _ = tx.send(Action::GuildsLoaded(guilds)).await;
@@ -252,6 +256,9 @@ fn execute_effect_mock(
         }
         Effect::LoadChannels { guild_id } => {
             let tx = tx.clone();
+            let _ = tx.try_send(Action::LoadStarted(LoadScope::ChannelList(
+                guild_id.clone(),
+            )));
             let channels = mock::channels(&guild_id);
             tokio::spawn(async move {
                 let _ = tx
@@ -264,6 +271,7 @@ fn execute_effect_mock(
         }
         Effect::LoadHistory { channel_id } => {
             let tx = tx.clone();
+            let _ = tx.try_send(Action::LoadStarted(LoadScope::History(channel_id.clone())));
             let messages = mock::messages(&channel_id);
             tokio::spawn(async move {
                 let _ = tx
@@ -289,6 +297,10 @@ fn execute_effect_mock(
 }
 
 #[cfg(feature = "experimental-discord")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "live Discord effect execution groups all REST-backed load paths in one dispatcher"
+)]
 fn execute_effect_discord(
     effect: Effect,
     tx: &mpsc::Sender<Action>,
@@ -305,6 +317,9 @@ fn execute_effect_discord(
             let http = ds.client.http().clone();
             let cache = ds.client.cache().clone();
             let tx = tx.clone();
+            let _ = tx.try_send(Action::LoadStarted(LoadScope::ChannelList(
+                guild_id.clone(),
+            )));
             tokio::spawn(async move {
                 let action = if guild_id == DIRECT_MESSAGES_GUILD_ID {
                     let manager = diself::ChannelsManager;
@@ -318,7 +333,10 @@ fn execute_effect_discord(
                                 channels: summaries,
                             }
                         }
-                        Err(e) => Action::Error(format!("failed to load direct messages: {e}")),
+                        Err(e) => Action::LoadFailed {
+                            scope: LoadScope::ChannelList(guild_id),
+                            message: format!("failed to load direct messages: {e}"),
+                        },
                     }
                 } else {
                     let url = format!("https://discord.com/api/v10/guilds/{guild_id}/channels");
@@ -336,9 +354,15 @@ fn execute_effect_discord(
                                     channels: summaries,
                                 }
                             }
-                            Err(e) => Action::Error(format!("failed to decode channel list: {e}")),
+                            Err(e) => Action::LoadFailed {
+                                scope: LoadScope::ChannelList(guild_id.clone()),
+                                message: format!("failed to decode channel list: {e}"),
+                            },
                         },
-                        Err(e) => Action::Error(format!("failed to load channels: {e}")),
+                        Err(e) => Action::LoadFailed {
+                            scope: LoadScope::ChannelList(guild_id),
+                            message: format!("failed to load channels: {e}"),
+                        },
                     }
                 };
                 let _ = tx.send(action).await;
@@ -347,6 +371,7 @@ fn execute_effect_discord(
         Effect::LoadHistory { channel_id } => {
             let http = ds.client.http().clone();
             let tx = tx.clone();
+            let _ = tx.try_send(Action::LoadStarted(LoadScope::History(channel_id.clone())));
             tokio::spawn(async move {
                 let url =
                     format!("https://discord.com/api/v10/channels/{channel_id}/messages?limit=50");
@@ -362,7 +387,10 @@ fn execute_effect_discord(
                             has_more,
                         }
                     }
-                    Err(e) => Action::Error(format!("failed to load history: {e}")),
+                    Err(e) => Action::LoadFailed {
+                        scope: LoadScope::History(channel_id),
+                        message: format!("failed to load history: {e}"),
+                    },
                 };
                 let _ = tx.send(action).await;
             });
@@ -531,7 +559,9 @@ fn handle_discord_token_prompt_action(
                 return true;
             };
 
+            app.start_load_scope(LoadScope::StartupConnect);
             if let Err(err) = auth::store_token(&token) {
+                app.finish_load_scope(&LoadScope::StartupConnect);
                 app.set_discord_token_prompt_error(err.to_string());
                 token.zeroize();
                 return true;
@@ -545,6 +575,7 @@ fn handle_discord_token_prompt_action(
                     *transport_started = true;
                 }
                 Err(err) => {
+                    app.finish_load_scope(&LoadScope::StartupConnect);
                     app.set_discord_token_prompt_error(format!("Failed to connect: {err}"));
                 }
             }

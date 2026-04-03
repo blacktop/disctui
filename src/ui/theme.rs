@@ -1,10 +1,13 @@
 use ratatui::style::{Color, Modifier, Style};
 
 pub const MUTE_GLYPH: &str = "⊘";
+pub const DISCORD_BLURPLE: Color = Color::Rgb(88, 101, 242);
+pub const DISCORD_BLURPLE_LIGHT: Color = Color::Rgb(121, 134, 255);
+pub const DISCORD_BG_DARK: Color = Color::Rgb(35, 39, 42);
 
 // Pane border when focused
 pub fn focused_border() -> Style {
-    Style::new().fg(Color::Cyan)
+    Style::new().fg(DISCORD_BLURPLE)
 }
 
 // Pane border when not focused
@@ -14,7 +17,20 @@ pub fn unfocused_border() -> Style {
 
 // Selected item in a list
 pub fn selected_item() -> Style {
-    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    Style::new()
+        .fg(DISCORD_BLURPLE_LIGHT)
+        .add_modifier(Modifier::BOLD)
+}
+
+pub fn selected_panel_row() -> Style {
+    Style::new()
+        .fg(Color::White)
+        .bg(Color::Rgb(78, 88, 150))
+        .add_modifier(Modifier::BOLD)
+}
+
+pub fn selected_avatar_only_row() -> Style {
+    Style::new().bg(Color::Rgb(67, 76, 130))
 }
 
 // Normal list item
@@ -25,26 +41,26 @@ pub fn normal_item() -> Style {
 
 // Unread indicator
 pub fn unread() -> Style {
-    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    Style::new()
+        .fg(DISCORD_BLURPLE_LIGHT)
+        .add_modifier(Modifier::BOLD)
 }
 
 // Status bar background
 pub fn status_bar() -> Style {
-    Style::new().fg(Color::White).bg(Color::DarkGray)
+    Style::new().fg(Color::White).bg(DISCORD_BG_DARK)
 }
 
-// Mode indicator in status bar
-pub fn mode_normal() -> Style {
+pub fn app_badge() -> Style {
     Style::new()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
+        .fg(Color::White)
+        .bg(DISCORD_BLURPLE)
         .add_modifier(Modifier::BOLD)
 }
 
-pub fn mode_insert() -> Style {
+pub fn title() -> Style {
     Style::new()
-        .fg(Color::Black)
-        .bg(Color::Green)
+        .fg(DISCORD_BLURPLE_LIGHT)
         .add_modifier(Modifier::BOLD)
 }
 
@@ -63,7 +79,9 @@ pub fn muted() -> Style {
 }
 
 pub fn mention() -> Style {
-    Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    Style::new()
+        .fg(DISCORD_BLURPLE_LIGHT)
+        .add_modifier(Modifier::BOLD)
 }
 
 pub fn link() -> Style {
@@ -82,7 +100,9 @@ pub fn quote() -> Style {
 
 // Summary header
 pub fn summary_header() -> Style {
-    Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+    Style::new()
+        .fg(DISCORD_BLURPLE_LIGHT)
+        .add_modifier(Modifier::BOLD)
 }
 
 // TODO bullet

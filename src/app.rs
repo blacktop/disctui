@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -8,7 +8,7 @@ use crate::action::Action;
 use crate::effect::Effect;
 use crate::model::{
     ChannelDigest, ChannelKind, ChannelSummary, DIRECT_MESSAGES_GUILD_ID,
-    DIRECT_MESSAGES_GUILD_NAME, GuildMuteSettings, GuildSummary, MessageRow,
+    DIRECT_MESSAGES_GUILD_NAME, GuildMuteSettings, GuildSummary, LoadScope, MessageRow,
 };
 use crate::store::{self, Store};
 use crate::ui::media::AvatarStore;
@@ -124,6 +124,8 @@ pub struct App {
     guild_channels: HashMap<String, Vec<ChannelSummary>>,
     /// User mute preferences from Discord notification settings.
     guild_mute_settings: HashMap<String, GuildMuteSettings>,
+    /// Active user-visible async loads for progress rendering.
+    active_loads: BTreeSet<LoadScope>,
     /// Tick counter for periodic refresh (every ~10s at 250ms tick rate).
     tick_count: u32,
     pub avatars: AvatarStore,
@@ -164,6 +166,7 @@ impl App {
             read_watermark: 0,
             guild_channels: HashMap::new(),
             guild_mute_settings: HashMap::new(),
+            active_loads: BTreeSet::new(),
             tick_count: 0,
             avatars,
         }
@@ -206,6 +209,13 @@ impl App {
             Action::Quit => self.should_quit = true,
             Action::Tick => return self.tick(),
             Action::Resize { .. } | Action::SubmitDiscordToken | Action::CancelDiscordToken => {}
+            Action::LoadStarted(scope) => {
+                self.start_load_scope(scope);
+            }
+            Action::LoadFailed { scope, message } => {
+                self.finish_load_scope(&scope);
+                self.set_error(message);
+            }
             Action::FocusNext => self.focus = self.focus.next(),
             Action::FocusPrev => self.focus = self.focus.prev(),
             Action::SetFocus(pane) => self.focus = pane,
@@ -247,19 +257,31 @@ impl App {
             Action::SendCurrentMessage => return self.handle_send(),
             Action::TransportConnecting => self.connection_state = ConnectionState::Connecting,
             Action::TransportConnected { username } => {
+                self.finish_load_scope(&LoadScope::StartupConnect);
+                if self.guilds.is_empty() {
+                    self.start_load_scope(LoadScope::GuildBootstrap);
+                }
                 self.connection_state = ConnectionState::Connected;
                 self.current_username = username;
             }
             Action::TransportDisconnected(reason) => {
+                self.finish_load_scope(&LoadScope::StartupConnect);
+                self.finish_load_scope(&LoadScope::GuildBootstrap);
                 self.connection_state = ConnectionState::Disconnected;
                 self.set_error(reason);
             }
-            Action::GuildsLoaded(g) => return self.handle_guilds_loaded(g),
+            Action::GuildsLoaded(g) => {
+                self.finish_load_scope(&LoadScope::GuildBootstrap);
+                return self.handle_guilds_loaded(g);
+            }
             Action::ReadyData {
                 guilds,
                 guild_channels,
                 guild_mute_settings,
-            } => return self.handle_ready_data(guilds, guild_channels, guild_mute_settings),
+            } => {
+                self.finish_load_scope(&LoadScope::GuildBootstrap);
+                return self.handle_ready_data(guilds, guild_channels, guild_mute_settings);
+            }
             Action::GuildAvailable { guild, channels } => {
                 return self.handle_guild_available(guild, channels);
             }
@@ -267,13 +289,19 @@ impl App {
                 self.handle_guild_mute_settings_updated(settings);
             }
             Action::ChannelsLoaded { guild_id, channels } => {
+                if let Some(guild_id) = guild_id.as_deref() {
+                    self.finish_load_scope(&LoadScope::ChannelList(guild_id.to_string()));
+                }
                 return self.handle_channels_loaded(guild_id.as_deref(), channels);
             }
             Action::HistoryLoaded {
                 messages,
                 channel_id,
                 ..
-            } => return self.handle_history_loaded(&channel_id, messages),
+            } => {
+                self.finish_load_scope(&LoadScope::History(channel_id.clone()));
+                return self.handle_history_loaded(&channel_id, messages);
+            }
             Action::MessageAppended(msg) => return self.handle_message_appended(msg),
             Action::MessagePatched(msg) => self.handle_message_patched(msg),
             Action::MessageRemoved {
@@ -340,6 +368,57 @@ impl App {
 
     pub fn status_error(&self) -> Option<&str> {
         self.status_error.as_ref().map(|(msg, _)| msg.as_str())
+    }
+
+    pub fn active_load_label(&self) -> Option<&'static str> {
+        self.prioritized_load_scope().map(LoadScope::status_label)
+    }
+
+    pub fn active_load_progress_bar(&self) -> Option<String> {
+        self.prioritized_load_scope()
+            .map(|_| ghostty_progress_bar(self.tick_count))
+    }
+
+    pub fn guild_pane_loading(&self) -> bool {
+        matches!(
+            self.prioritized_load_scope(),
+            Some(LoadScope::GuildBootstrap)
+        )
+    }
+
+    pub fn guild_pane_loading_bar(&self) -> Option<String> {
+        self.guild_pane_loading()
+            .then(|| ghostty_progress_bar(self.tick_count))
+    }
+
+    pub fn channels_pane_loading(&self) -> bool {
+        let Some(guild_id) = self.selected_guild_id.as_deref() else {
+            return false;
+        };
+        matches!(
+            self.prioritized_load_scope(),
+            Some(LoadScope::ChannelList(active_guild_id)) if active_guild_id == guild_id
+        )
+    }
+
+    pub fn channels_pane_loading_bar(&self) -> Option<String> {
+        self.channels_pane_loading()
+            .then(|| ghostty_progress_bar(self.tick_count))
+    }
+
+    pub fn messages_pane_loading(&self) -> bool {
+        let Some(channel_id) = self.selected_channel_id.as_deref() else {
+            return false;
+        };
+        matches!(
+            self.prioritized_load_scope(),
+            Some(LoadScope::History(active_channel_id)) if active_channel_id == channel_id
+        )
+    }
+
+    pub fn messages_pane_loading_bar(&self) -> Option<String> {
+        self.messages_pane_loading()
+            .then(|| ghostty_progress_bar(self.tick_count))
     }
 
     pub fn discord_token_prompt(&self) -> Option<&DiscordTokenPromptState> {
@@ -461,6 +540,21 @@ impl App {
         }
 
         cleared
+    }
+
+    pub(crate) fn start_load_scope(&mut self, scope: LoadScope) {
+        self.active_loads.insert(scope);
+    }
+
+    pub(crate) fn finish_load_scope(&mut self, scope: &LoadScope) {
+        self.active_loads.remove(scope);
+    }
+
+    // Display priority is independent of BTreeSet ordering.
+    fn prioritized_load_scope(&self) -> Option<&LoadScope> {
+        self.active_loads
+            .iter()
+            .max_by_key(|scope| scope.display_priority())
     }
 
     fn ensure_direct_messages_guild(guilds: &mut Vec<GuildSummary>) {
@@ -1104,6 +1198,7 @@ impl App {
         match self.focus {
             FocusPane::Guilds => {
                 move_list_selection(&mut self.guild_state, self.guilds.len(), delta);
+                self.sync_guild_list_offset();
             }
             FocusPane::Channels => {
                 self.move_channel_selection(delta);
@@ -1138,6 +1233,7 @@ impl App {
             FocusPane::Guilds if !self.guilds.is_empty() => {
                 let idx = if to_top { 0 } else { self.guilds.len() - 1 };
                 self.guild_state.select(Some(idx));
+                self.sync_guild_list_offset();
             }
             FocusPane::Channels if !self.channels.is_empty() => {
                 let indices = self.selectable_channel_indices();
@@ -1291,6 +1387,14 @@ impl App {
         };
         self.channel_state.select(Some(selectable[next_pos]));
     }
+
+    fn sync_guild_list_offset(&mut self) {
+        let Some(selected) = self.guild_state.selected() else {
+            return;
+        };
+        // Keep the selected guild pinned in view when the guild rail collapses to avatars-only.
+        *self.guild_state.offset_mut() = selected;
+    }
 }
 
 fn move_list_selection(state: &mut ListState, len: usize, delta: i32) {
@@ -1304,6 +1408,20 @@ fn move_list_selection(state: &mut ListState, len: usize, delta: i32) {
         current.saturating_sub(1)
     };
     state.select(Some(new));
+}
+
+fn ghostty_progress_bar(tick_count: u32) -> String {
+    const WIDTH: usize = 8;
+    const SEGMENT_WIDTH: usize = 3;
+
+    let mut cells = ['▱'; WIDTH];
+    let offset = usize::try_from(tick_count).unwrap_or_default() % WIDTH;
+    for segment_idx in 0..SEGMENT_WIDTH {
+        let idx = (offset + segment_idx) % WIDTH;
+        cells[idx] = '▰';
+    }
+
+    cells.iter().collect()
 }
 
 #[cfg(test)]
@@ -1579,6 +1697,13 @@ mod tests {
     }
 
     #[test]
+    fn ghostty_progress_bar_wraps_cleanly() {
+        assert_eq!(ghostty_progress_bar(0), "▰▰▰▱▱▱▱▱");
+        assert_eq!(ghostty_progress_bar(7), "▰▰▱▱▱▱▱▰");
+        assert_eq!(ghostty_progress_bar(8), "▰▰▰▱▱▱▱▱");
+    }
+
+    #[test]
     fn set_focus_targets_specific_pane() {
         let mut app = App::new();
         app.update(Action::SetFocus(FocusPane::Messages));
@@ -1662,6 +1787,78 @@ mod tests {
             .unwrap();
         assert!(!dm.unread);
         assert_eq!(dm.unread_count, 0);
+    }
+
+    #[test]
+    fn load_priority_prefers_history_over_channel_list() {
+        let mut app = App::new();
+        app.selected_guild_id = Some("g1".into());
+        app.selected_channel_id = Some("c1".into());
+        app.start_load_scope(LoadScope::ChannelList("g1".into()));
+        app.start_load_scope(LoadScope::History("c1".into()));
+
+        assert_eq!(app.active_load_label(), Some("Refreshing history"));
+        assert!(app.messages_pane_loading());
+        assert!(!app.channels_pane_loading());
+    }
+
+    #[test]
+    fn transport_connected_switches_to_guild_bootstrap_load() {
+        let mut app = App::new();
+        app.start_load_scope(LoadScope::StartupConnect);
+
+        app.update(Action::TransportConnected {
+            username: "you".into(),
+        });
+
+        assert_eq!(app.active_load_label(), Some("Loading guilds"));
+        assert_eq!(app.connection_state, ConnectionState::Connected);
+    }
+
+    #[test]
+    fn transport_connected_after_ready_data_does_not_restore_bootstrap_load() {
+        let mut app = App::new();
+        app.start_load_scope(LoadScope::StartupConnect);
+
+        app.update(Action::ReadyData {
+            guilds: mock::guilds(),
+            guild_channels: HashMap::new(),
+            guild_mute_settings: HashMap::new(),
+        });
+        app.update(Action::TransportConnected {
+            username: "you".into(),
+        });
+
+        assert_eq!(app.active_load_label(), None);
+        assert_eq!(app.connection_state, ConnectionState::Connected);
+    }
+
+    #[test]
+    fn stale_channels_loaded_clears_matching_load_scope() {
+        let mut app = App::new();
+        app.selected_guild_id = Some("g2".into());
+        app.start_load_scope(LoadScope::ChannelList("g1".into()));
+
+        app.update(Action::ChannelsLoaded {
+            guild_id: Some("g1".into()),
+            channels: Vec::new(),
+        });
+
+        assert_eq!(app.active_load_label(), None);
+    }
+
+    #[test]
+    fn load_failed_clears_scope_and_sets_error() {
+        let mut app = App::new();
+        app.start_load_scope(LoadScope::History("c1".into()));
+
+        app.update(Action::LoadFailed {
+            scope: LoadScope::History("c1".into()),
+            message: "boom".into(),
+        });
+
+        assert_eq!(app.active_load_label(), None);
+        assert_eq!(app.status_error(), Some("boom"));
     }
 
     #[test]

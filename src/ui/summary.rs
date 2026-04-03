@@ -1,6 +1,5 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
-use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
@@ -41,7 +40,7 @@ pub fn render(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .title(" Summary ".bold().magenta()),
+                .title(Span::styled(" Summary ", theme::title())),
         )
         .wrap(Wrap { trim: false });
 
