@@ -142,8 +142,15 @@ impl EventHandler for DiscordBridge {
         });
     }
 
-    async fn on_message_create(&self, _ctx: &Context, message: Message) {
-        self.send(Action::MessageAppended(message_to_row(&message, false)));
+    async fn on_message_create(&self, ctx: &Context, message: Message) {
+        let channel_hint = ctx
+            .cache
+            .channel(&message.channel_id)
+            .and_then(|channel| channel_to_summary(&channel));
+        self.send(Action::MessageAppended {
+            message: message_to_row(&message, false),
+            channel_hint,
+        });
     }
 
     async fn on_message_update(&self, _ctx: &Context, message: Message) {
@@ -211,7 +218,7 @@ pub fn connect(
             .map_err(|e| color_eyre::eyre::eyre!("failed to build discord client: {e}"))?
             .with_cache_config(CacheConfig {
                 cache_users: false,
-                cache_channels: false,
+                cache_channels: true,
                 cache_guilds: false,
                 cache_relationships: false,
             })
@@ -382,7 +389,10 @@ pub fn channel_to_summary(ch: &diself::Channel) -> Option<ChannelSummary> {
     use diself::model::ChannelType;
     let is_direct_message = matches!(ch.kind, ChannelType::DM | ChannelType::GroupDM);
     let kind = match ch.kind {
-        ChannelType::GuildText => ChannelKind::Text,
+        ChannelType::GuildText
+        | ChannelType::AnnouncementThread
+        | ChannelType::PublicThread
+        | ChannelType::PrivateThread => ChannelKind::Text,
         ChannelType::GuildAnnouncement => ChannelKind::Announcement,
         ChannelType::GuildCategory => ChannelKind::Category,
         ChannelType::DM | ChannelType::GroupDM => ChannelKind::DirectMessage,

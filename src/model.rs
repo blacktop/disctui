@@ -44,7 +44,6 @@ pub struct ChannelSummary {
     pub parent_id: Option<String>,
     pub name: String,
     pub kind: ChannelKind,
-    #[cfg_attr(not(feature = "experimental-discord"), expect(dead_code))]
     pub position: i32,
     pub muted: bool,
     pub unread: bool,
@@ -58,8 +57,12 @@ impl ChannelSummary {
         guild_muted || self.muted
     }
 
-    pub const fn shows_unread(&self, guild_muted: bool) -> bool {
+    pub const fn shows_unread_in_guild_rollup(&self, guild_muted: bool) -> bool {
         self.unread && !self.is_effectively_muted(guild_muted)
+    }
+
+    pub const fn shows_unread_in_channel_list(&self) -> bool {
+        self.unread && !self.muted
     }
 }
 

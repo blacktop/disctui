@@ -33,7 +33,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     render_header(frame, header_area, app);
 
     let guild_pane_loading_bar = app.guild_pane_loading_bar();
-    let selected_guild_muted = app.selected_guild_muted();
     let channels_pane_loading_bar = app.channels_pane_loading_bar();
     let messages_pane_loading_bar = app.messages_pane_loading_bar();
 
@@ -55,7 +54,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         &mut app.channel_state,
         app.focus == FocusPane::Channels,
         channels_pane_loading_bar.as_deref(),
-        selected_guild_muted,
         app.selected_channel_id.as_deref(),
     );
 

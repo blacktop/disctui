@@ -8,10 +8,6 @@ use crate::model::{ChannelKind, ChannelSummary};
 use crate::ui::theme;
 use crate::ui::truncate_name;
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "top-level pane renderer takes explicit widget state and loading context"
-)]
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -19,7 +15,6 @@ pub fn render(
     state: &mut ListState,
     focused: bool,
     loading_bar: Option<&str>,
-    guild_muted: bool,
     selected_channel_id: Option<&str>,
 ) {
     let border_style = if focused {
@@ -48,7 +43,7 @@ pub fn render(
                     .muted
                     .then(|| Span::styled(format!(" {}", theme::MUTE_GLYPH), theme::muted()));
 
-                if ch.shows_unread(guild_muted) {
+                if ch.shows_unread_in_channel_list() {
                     let mut spans = vec![
                         Span::styled("  \u{25cf} ", theme::unread()), // bold cyan dot
                         Span::styled(

@@ -83,7 +83,10 @@ pub enum Action {
         messages: Vec<MessageRow>,
         has_more: bool,
     },
-    MessageAppended(MessageRow),
+    MessageAppended {
+        message: MessageRow,
+        channel_hint: Option<ChannelSummary>,
+    },
     MessagePatched(MessageRow),
     MessageRemoved {
         channel_id: String,

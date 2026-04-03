@@ -302,7 +302,10 @@ impl App {
                 self.finish_load_scope(&LoadScope::History(channel_id.clone()));
                 return self.handle_history_loaded(&channel_id, messages);
             }
-            Action::MessageAppended(msg) => return self.handle_message_appended(msg),
+            Action::MessageAppended {
+                message,
+                channel_hint,
+            } => return self.handle_message_appended(message, channel_hint),
             Action::MessagePatched(msg) => self.handle_message_patched(msg),
             Action::MessageRemoved {
                 channel_id,
@@ -607,11 +610,16 @@ impl App {
 
         let total: u32 = channels
             .iter()
-            .filter(|channel| channel.shows_unread(guild_muted))
+            .filter(|channel| channel.shows_unread_in_guild_rollup(guild_muted))
             .map(|channel| channel.unread_count.max(1))
             .sum();
         guild.unread = total > 0;
         guild.unread_count = total;
+    }
+
+    fn sort_visible_channels(&mut self) {
+        self.channels
+            .sort_by(|a, b| a.position.cmp(&b.position).then(a.name.cmp(&b.name)));
     }
 
     fn apply_guild_mute_settings_to_channels(
@@ -1105,7 +1113,11 @@ impl App {
         Vec::new()
     }
 
-    fn handle_message_appended(&mut self, msg: MessageRow) -> Vec<Effect> {
+    fn handle_message_appended(
+        &mut self,
+        msg: MessageRow,
+        channel_hint: Option<ChannelSummary>,
+    ) -> Vec<Effect> {
         if self.selected_channel_id.as_deref() == Some(&msg.channel_id) {
             let effects = self.request_avatar_effects(msg.author_avatar_url.as_deref());
             let mut attachment_effects = self.request_avatar_effects(
@@ -1124,20 +1136,49 @@ impl App {
         let channel_id = &msg.channel_id;
         let msg_id = msg.id.clone();
         let mut affected_guild_id: Option<String> = None;
+        let mut matched_channel = false;
         for channels in self.guild_channels.values_mut() {
             if let Some(ch) = channels.iter_mut().find(|c| c.id == *channel_id) {
-                ch.unread = true;
-                ch.unread_count = ch.unread_count.saturating_add(1);
-                ch.last_message_id = Some(msg_id.clone());
+                mark_channel_unread(ch, &msg_id);
                 affected_guild_id.clone_from(&ch.guild_id);
+                matched_channel = true;
                 break;
             }
         }
         if let Some(ch) = self.channels.iter_mut().find(|c| c.id == *channel_id) {
-            ch.unread = true;
-            ch.unread_count = ch.unread_count.saturating_add(1);
-            ch.last_message_id = Some(msg_id.clone());
+            mark_channel_unread(ch, &msg_id);
+            matched_channel = true;
         }
+
+        if !matched_channel && let Some(mut hinted_channel) = channel_hint {
+            if let Some(guild_id) = hinted_channel.guild_id.clone() {
+                Self::apply_guild_mute_settings_to_channels(
+                    &guild_id,
+                    std::slice::from_mut(&mut hinted_channel),
+                    &self.guild_mute_settings,
+                );
+                mark_channel_unread(&mut hinted_channel, &msg_id);
+                affected_guild_id = Some(guild_id.clone());
+                let cached_channels = self.guild_channels.entry(guild_id.clone()).or_default();
+                if !cached_channels
+                    .iter()
+                    .any(|channel| channel.id == hinted_channel.id)
+                {
+                    cached_channels.push(hinted_channel.clone());
+                }
+
+                if self.selected_guild_id.as_deref() == Some(guild_id.as_str())
+                    && !self
+                        .channels
+                        .iter()
+                        .any(|channel| channel.id == hinted_channel.id)
+                {
+                    self.channels.push(hinted_channel);
+                    self.sort_visible_channels();
+                }
+            }
+        }
+
         // Mark the parent guild as unread, respecting mute visibility rules.
         if let Some(guild_id) = affected_guild_id {
             self.sync_guild_unread_from_channels(&guild_id);
@@ -1422,6 +1463,12 @@ fn ghostty_progress_bar(tick_count: u32) -> String {
     }
 
     cells.iter().collect()
+}
+
+fn mark_channel_unread(channel: &mut ChannelSummary, message_id: &str) {
+    channel.unread = true;
+    channel.unread_count = channel.unread_count.saturating_add(1);
+    channel.last_message_id = Some(message_id.to_string());
 }
 
 #[cfg(test)]
@@ -1862,7 +1909,7 @@ mod tests {
     }
 
     #[test]
-    fn muted_guild_hides_non_mention_unread_indicators() {
+    fn muted_guild_hides_guild_unread_but_not_channel_rows() {
         let mut app = app_with_guilds();
         app.focus = FocusPane::Guilds;
         let effects = app.update(Action::OpenSelected);
@@ -1909,7 +1956,8 @@ mod tests {
         assert!(
             app.channels
                 .iter()
-                .all(|channel| !channel.shows_unread(app.selected_guild_muted()))
+                .filter(|channel| channel.kind.is_selectable())
+                .any(ChannelSummary::shows_unread_in_channel_list)
         );
         assert_eq!(
             app.channels
@@ -2059,17 +2107,20 @@ mod tests {
         // At bottom (offset 0)
         assert_eq!(app.message_scroll_offset, 0);
 
-        app.update(Action::MessageAppended(MessageRow {
-            id: "new1".into(),
-            channel_id: app.selected_channel_id.clone().unwrap(),
-            author: "someone".into(),
-            author_avatar_url: None,
-            content: "new message".into(),
-            attachments: Vec::new(),
-            timestamp: "12:00".into(),
-            edited: false,
-            is_continuation: false,
-        }));
+        app.update(Action::MessageAppended {
+            message: MessageRow {
+                id: "new1".into(),
+                channel_id: app.selected_channel_id.clone().unwrap(),
+                author: "someone".into(),
+                author_avatar_url: None,
+                content: "new message".into(),
+                attachments: Vec::new(),
+                timestamp: "12:00".into(),
+                edited: false,
+                is_continuation: false,
+            },
+            channel_hint: None,
+        });
 
         assert_eq!(
             app.message_scroll_offset, 0,
@@ -2086,17 +2137,20 @@ mod tests {
         app.update(Action::MoveDown);
         assert_eq!(app.message_scroll_offset, 2);
 
-        app.update(Action::MessageAppended(MessageRow {
-            id: "new2".into(),
-            channel_id: app.selected_channel_id.clone().unwrap(),
-            author: "someone".into(),
-            author_avatar_url: None,
-            content: "new while scrolled".into(),
-            attachments: Vec::new(),
-            timestamp: "12:01".into(),
-            edited: false,
-            is_continuation: false,
-        }));
+        app.update(Action::MessageAppended {
+            message: MessageRow {
+                id: "new2".into(),
+                channel_id: app.selected_channel_id.clone().unwrap(),
+                author: "someone".into(),
+                author_avatar_url: None,
+                content: "new while scrolled".into(),
+                attachments: Vec::new(),
+                timestamp: "12:01".into(),
+                edited: false,
+                is_continuation: false,
+            },
+            channel_hint: None,
+        });
 
         assert_eq!(
             app.message_scroll_offset, 2,
@@ -2287,17 +2341,20 @@ mod tests {
 
         // Simulate new messages arriving (unread)
         let ch_id = app.selected_channel_id.clone().unwrap();
-        app.update(Action::MessageAppended(MessageRow {
-            id: "new1".into(),
-            channel_id: ch_id.clone(),
-            author: "someone".into(),
-            author_avatar_url: None,
-            content: "unread message".into(),
-            attachments: Vec::new(),
-            timestamp: "15:00".into(),
-            edited: false,
-            is_continuation: false,
-        }));
+        app.update(Action::MessageAppended {
+            message: MessageRow {
+                id: "new1".into(),
+                channel_id: ch_id.clone(),
+                author: "someone".into(),
+                author_avatar_url: None,
+                content: "unread message".into(),
+                attachments: Vec::new(),
+                timestamp: "15:00".into(),
+                edited: false,
+                is_continuation: false,
+            },
+            channel_hint: None,
+        });
 
         let effects = app.update(Action::RequestSummary);
         assert_eq!(effects.len(), 1);
@@ -2305,6 +2362,138 @@ mod tests {
             matches!(&effects[0], Effect::SummarizeChannel { messages, .. } if messages.len() == 1),
             "should emit SummarizeChannel with exactly 1 unread message"
         );
+    }
+
+    #[test]
+    fn background_message_with_channel_hint_marks_unknown_channel_unread() {
+        let mut app = app_in_channel();
+        let guild_id = app.selected_guild_id.clone().unwrap();
+        let hinted_channel_id = "c-new".to_string();
+
+        app.update(Action::MessageAppended {
+            message: MessageRow {
+                id: "m-new".into(),
+                channel_id: hinted_channel_id.clone(),
+                author: "someone".into(),
+                author_avatar_url: None,
+                content: "background update".into(),
+                attachments: Vec::new(),
+                timestamp: "16:00".into(),
+                edited: false,
+                is_continuation: false,
+            },
+            channel_hint: Some(ChannelSummary {
+                id: hinted_channel_id.clone(),
+                guild_id: Some(guild_id.clone()),
+                parent_id: None,
+                name: "new-channel".into(),
+                kind: ChannelKind::Text,
+                position: 999,
+                muted: false,
+                unread: false,
+                unread_count: 0,
+                last_message_id: None,
+            }),
+        });
+
+        let visible = app
+            .channels
+            .iter()
+            .find(|channel| channel.id == hinted_channel_id)
+            .unwrap();
+        assert!(visible.unread);
+        assert_eq!(visible.unread_count, 1);
+
+        let cached = app
+            .guild_channels
+            .get(&guild_id)
+            .unwrap()
+            .iter()
+            .find(|channel| channel.id == hinted_channel_id)
+            .unwrap();
+        assert!(cached.unread);
+        assert_eq!(cached.unread_count, 1);
+
+        let guild = app
+            .guilds
+            .iter()
+            .find(|guild| guild.id == guild_id)
+            .unwrap();
+        assert!(guild.unread);
+        assert!(guild.unread_count >= 1);
+    }
+
+    #[test]
+    fn hinted_muted_channel_stays_hidden_in_channel_list() {
+        let mut app = app_in_channel();
+        let guild_id = app.selected_guild_id.clone().unwrap();
+        let hinted_channel_id = "c-muted".to_string();
+
+        if let Some(cached_channels) = app.guild_channels.get_mut(&guild_id) {
+            for channel in cached_channels {
+                channel.unread = false;
+                channel.unread_count = 0;
+            }
+        }
+        for channel in &mut app.channels {
+            channel.unread = false;
+            channel.unread_count = 0;
+        }
+        if let Some(guild) = app.guilds.iter_mut().find(|guild| guild.id == guild_id) {
+            guild.unread = false;
+            guild.unread_count = 0;
+        }
+
+        app.update(Action::GuildMuteSettingsUpdated(GuildMuteSettings {
+            guild_id: guild_id.clone(),
+            muted: false,
+            channel_overrides: HashMap::from([(
+                hinted_channel_id.clone(),
+                crate::model::ChannelMuteOverride { muted: true },
+            )]),
+        }));
+
+        app.update(Action::MessageAppended {
+            message: MessageRow {
+                id: "m-muted".into(),
+                channel_id: hinted_channel_id.clone(),
+                author: "someone".into(),
+                author_avatar_url: None,
+                content: "background update".into(),
+                attachments: Vec::new(),
+                timestamp: "16:05".into(),
+                edited: false,
+                is_continuation: false,
+            },
+            channel_hint: Some(ChannelSummary {
+                id: hinted_channel_id.clone(),
+                guild_id: Some(guild_id.clone()),
+                parent_id: None,
+                name: "muted-thread".into(),
+                kind: ChannelKind::Text,
+                position: 1000,
+                muted: false,
+                unread: false,
+                unread_count: 0,
+                last_message_id: None,
+            }),
+        });
+
+        let visible = app
+            .channels
+            .iter()
+            .find(|channel| channel.id == hinted_channel_id)
+            .unwrap();
+        assert!(visible.muted);
+        assert!(!visible.shows_unread_in_channel_list());
+
+        let guild = app
+            .guilds
+            .iter()
+            .find(|guild| guild.id == guild_id)
+            .unwrap();
+        assert!(!guild.unread);
+        assert_eq!(guild.unread_count, 0);
     }
 
     #[test]
