@@ -1,6 +1,6 @@
 <p align="center">
   <a href="https://github.com/blacktop/disctui"><img alt="Logo" src="https://raw.githubusercontent.com/blacktop/disctui/refs/heads/main/docs/logo.webp" height="400"/></a>
-  <h1 align="center">disctui</h1>
+  <!--<h1 align="center">disctui</h1>-->
   <h4><p align="center">A fast, minimal Discord TUI with AI-powered conversation summaries</p></h4>
   <p align="center">
     <a href="https://github.com/blacktop/disctui/actions" alt="Actions">
