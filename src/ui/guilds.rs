@@ -1,6 +1,7 @@
 use crate::model::GuildSummary;
 use crate::ui::media::{AvatarStore, badge_from_name};
 use crate::ui::theme;
+use crate::ui::truncate_name;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style, Stylize};
@@ -47,6 +48,9 @@ pub fn render(
         .map(|g| {
             let badge = badge_from_name(&g.name);
             let name = truncate_name(&g.name, list_area.width.saturating_sub(8) as usize);
+            let mute_marker = g
+                .muted
+                .then(|| Span::styled(format!(" {}", theme::MUTE_GLYPH), theme::muted()));
 
             if g.unread {
                 let mut spans = vec![
@@ -58,6 +62,9 @@ pub fn render(
                             .add_modifier(Modifier::BOLD),
                     ),
                 ];
+                if let Some(marker) = mute_marker.clone() {
+                    spans.push(marker);
+                }
                 if g.unread_count > 0 {
                     spans.push(Span::styled(
                         format!(" {}", g.unread_count),
@@ -66,8 +73,11 @@ pub fn render(
                 }
                 ListItem::new(Line::from(spans))
             } else {
-                let label = format!("  {badge} {name}");
-                ListItem::new(Line::from(label.dim()))
+                let mut spans = vec![Span::styled(format!("  {badge} {name}"), theme::dim())];
+                if let Some(marker) = mute_marker {
+                    spans.push(marker);
+                }
+                ListItem::new(Line::from(spans))
             }
         })
         .collect();
@@ -111,13 +121,14 @@ fn render_selected_guild_preview(
     );
     let info = Paragraph::new(vec![
         Line::from(selected.name.clone().bold().cyan()),
-        Line::from(format!("{} unread", selected.unread_count).dim()),
+        Line::from(if selected.muted {
+            format!("muted · {} unread", selected.unread_count).dim()
+        } else {
+            format!("{} unread", selected.unread_count).dim()
+        }),
     ]);
     frame.render_widget(info, text_area);
 }
-
-use super::truncate_name;
-
 #[cfg(test)]
 mod tests {
     use crate::ui::truncate_name;

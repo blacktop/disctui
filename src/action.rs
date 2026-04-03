@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::app::FocusPane;
-use crate::model::{ChannelDigest, ChannelSummary, GuildSummary, MessageRow};
+use crate::model::{ChannelDigest, ChannelSummary, GuildMuteSettings, GuildSummary, MessageRow};
 
 #[derive(Debug, Clone)]
 #[expect(
@@ -30,6 +30,8 @@ pub enum Action {
     EnterInsert,
     ExitInsert,
     ToggleHelp,
+    SubmitDiscordToken,
+    CancelDiscordToken,
 
     // Read state
     MarkAllRead,
@@ -58,11 +60,13 @@ pub enum Action {
     ReadyData {
         guilds: Vec<GuildSummary>,
         guild_channels: HashMap<String, Vec<ChannelSummary>>,
+        guild_mute_settings: HashMap<String, GuildMuteSettings>,
     },
     GuildAvailable {
         guild: GuildSummary,
         channels: Vec<ChannelSummary>,
     },
+    GuildMuteSettingsUpdated(GuildMuteSettings),
     ChannelsLoaded {
         guild_id: Option<String>,
         channels: Vec<ChannelSummary>,

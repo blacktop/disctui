@@ -24,7 +24,7 @@ thiserror = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 unicode-width = "0.2"
 libc = "0.2"
-rusqlite = { version = "0.35", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 ratatui-image = { version = "10.0", default-features = false, features = ["crossterm", "image-defaults"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 textwrap = "0.16"
@@ -35,7 +35,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # Optional transport
 diself = { version = "0.3", optional = true }
 async-trait = { version = "0.1", optional = true }
-keyring = { version = "3.6", optional = true }
+keyring = { version = "3.6", optional = true, features = ["apple-native"] }
 zeroize = { version = "1.8", features = ["derive"], optional = true }
 
 [features]

@@ -1,4 +1,6 @@
-use crate::model::{ChannelKind, ChannelSummary, GuildSummary, MessageRow};
+use crate::model::{
+    ChannelKind, ChannelSummary, DIRECT_MESSAGES_GUILD_ID, GuildSummary, MessageRow,
+};
 
 /// Load fixture guilds.
 pub fn guilds() -> Vec<GuildSummary> {
@@ -6,6 +8,7 @@ pub fn guilds() -> Vec<GuildSummary> {
         GuildSummary {
             id: "g1".into(),
             name: "Rust Lang".into(),
+            muted: false,
             unread: true,
             unread_count: 3,
             avatar_url: None,
@@ -13,6 +16,7 @@ pub fn guilds() -> Vec<GuildSummary> {
         GuildSummary {
             id: "g2".into(),
             name: "ratatui".into(),
+            muted: false,
             unread: false,
             unread_count: 0,
             avatar_url: None,
@@ -20,6 +24,7 @@ pub fn guilds() -> Vec<GuildSummary> {
         GuildSummary {
             id: "g3".into(),
             name: "Tokio".into(),
+            muted: false,
             unread: true,
             unread_count: 12,
             avatar_url: None,
@@ -27,6 +32,7 @@ pub fn guilds() -> Vec<GuildSummary> {
         GuildSummary {
             id: "g4".into(),
             name: "Nix/NixOS".into(),
+            muted: false,
             unread: false,
             unread_count: 0,
             avatar_url: None,
@@ -66,6 +72,11 @@ pub fn channels(guild_id: &str) -> Vec<ChannelSummary> {
             category("cat31", "g4", "Tooling", 10),
             channel("c32", "g4", Some("cat31"), "flakes", false, 0, 11),
         ],
+        DIRECT_MESSAGES_GUILD_ID => vec![
+            direct_message("dm1", "alice", true, 2),
+            direct_message("dm2", "build-bot", false, 0),
+            direct_message("dm3", "incident-room", true, 1),
+        ],
         _ => Vec::new(),
     }
 }
@@ -77,6 +88,9 @@ pub fn messages(channel_id: &str) -> Vec<MessageRow> {
         "c3" => rust_help_messages(),
         "c10" => ratatui_general_messages(),
         "c20" => tokio_general_messages(),
+        "dm1" => direct_messages_from_alice(),
+        "dm2" => build_bot_messages(),
+        "dm3" => incident_room_messages(),
         _ => vec![MessageRow {
             id: format!("{channel_id}_m1"),
             channel_id: channel_id.into(),
@@ -91,6 +105,21 @@ pub fn messages(channel_id: &str) -> Vec<MessageRow> {
     }
 }
 
+fn direct_message(id: &str, name: &str, unread: bool, count: u32) -> ChannelSummary {
+    ChannelSummary {
+        id: id.into(),
+        guild_id: Some(DIRECT_MESSAGES_GUILD_ID.into()),
+        parent_id: None,
+        name: name.into(),
+        kind: ChannelKind::DirectMessage,
+        position: 0,
+        muted: false,
+        unread,
+        unread_count: count,
+        last_message_id: None,
+    }
+}
+
 fn category(id: &str, guild_id: &str, name: &str, position: i32) -> ChannelSummary {
     ChannelSummary {
         id: id.into(),
@@ -99,6 +128,7 @@ fn category(id: &str, guild_id: &str, name: &str, position: i32) -> ChannelSumma
         name: name.into(),
         kind: ChannelKind::Category,
         position,
+        muted: false,
         unread: false,
         unread_count: 0,
         last_message_id: None,
@@ -121,6 +151,7 @@ fn channel(
         name: name.into(),
         kind: ChannelKind::Text,
         position,
+        muted: false,
         unread,
         unread_count: count,
         last_message_id: None,
@@ -275,6 +306,77 @@ fn rust_help_messages() -> Vec<MessageRow> {
             "newbie",
             "Thanks! The lossy version is what I need",
             "11:03",
+            false,
+        ),
+    ]
+}
+
+fn direct_messages_from_alice() -> Vec<MessageRow> {
+    vec![
+        msg(
+            "dm1_m1",
+            "dm1",
+            "alice",
+            "Can you review the latest Discord transport patch when you get a minute?",
+            "08:45",
+            false,
+        ),
+        msg(
+            "dm1_m2",
+            "dm1",
+            "you",
+            "Yes, send me the branch once you push it.",
+            "08:47",
+            false,
+        ),
+        msg(
+            "dm1_m3",
+            "dm1",
+            "alice",
+            "Pushed. The unread handling still looks a bit off in DMs.",
+            "08:49",
+            false,
+        ),
+    ]
+}
+
+fn build_bot_messages() -> Vec<MessageRow> {
+    vec![
+        msg(
+            "dm2_m1",
+            "dm2",
+            "build-bot",
+            "nightly succeeded on main",
+            "07:10",
+            false,
+        ),
+        msg(
+            "dm2_m2",
+            "dm2",
+            "build-bot",
+            "coverage delta: +0.8%",
+            "07:10",
+            true,
+        ),
+    ]
+}
+
+fn incident_room_messages() -> Vec<MessageRow> {
+    vec![
+        msg(
+            "dm3_m1",
+            "dm3",
+            "ops",
+            "Seeing rate limit spikes again. Can you check the gateway logs?",
+            "09:12",
+            false,
+        ),
+        msg(
+            "dm3_m2",
+            "dm3",
+            "sre",
+            "The reconnect loop looks clean, but DMs are still missing from the sidebar.",
+            "09:13",
             false,
         ),
     ]

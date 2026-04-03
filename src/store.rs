@@ -88,14 +88,10 @@ impl Store {
             })
             .ok()
     }
-}
 
-#[cfg(test)]
-#[expect(clippy::unwrap_used, reason = "unwrap is fine in tests")]
-mod tests {
-    use super::*;
-
-    fn test_store() -> Store {
+    #[cfg(test)]
+    #[expect(clippy::unwrap_used, reason = "in-memory store helper is test-only")]
+    pub fn open_in_memory() -> Self {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS read_state (
@@ -109,7 +105,17 @@ mod tests {
             );",
         )
         .unwrap();
-        Store { conn }
+        Self { conn }
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "unwrap is fine in tests")]
+mod tests {
+    use super::*;
+
+    fn test_store() -> Store {
+        Store::open_in_memory()
     }
 
     #[test]

@@ -1,9 +1,10 @@
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
+use crate::app::DiscordTokenPromptState;
 use crate::ui::layout::centered_popup;
 use crate::ui::theme;
 
@@ -25,6 +26,10 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
         ]),
         Line::from(vec![" Tab       ".bold().cyan(), "Next pane".dim()]),
         Line::from(vec![" Shift+Tab ".bold().cyan(), "Previous pane".dim()]),
+        Line::from(vec![
+            " ← / →     ".bold().cyan(),
+            "Cycle left/right panels".dim(),
+        ]),
         Line::from(vec![" j / Down  ".bold().cyan(), "Move down".dim()]),
         Line::from(vec![" k / Up    ".bold().cyan(), "Move up".dim()]),
         Line::from(vec![" g         ".bold().cyan(), "Jump to top".dim()]),
@@ -44,6 +49,50 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
                 .borders(Borders::ALL)
                 .border_style(theme::focused_border())
                 .title(" Help ".bold().cyan()),
+        )
+        .wrap(Wrap { trim: false });
+
+    frame.render_widget(paragraph, popup_area);
+}
+
+/// Render the startup Discord token prompt.
+pub fn render_discord_token_prompt(
+    frame: &mut Frame,
+    area: Rect,
+    prompt: &DiscordTokenPromptState,
+) {
+    let popup_area = centered_popup(70, 40, area);
+    frame.render_widget(Clear, popup_area);
+
+    let masked_input = if prompt.input.is_empty() {
+        "Paste Discord token and press Enter".dim().to_string()
+    } else {
+        format!("{}█", "*".repeat(prompt.input.chars().count()))
+    };
+
+    let mut lines = vec![
+        Line::from(" Discord Token ".bold().cyan()),
+        Line::raw(""),
+        Line::from("No token found in DISCTUI_TOKEN or the macOS Keychain.".dim()),
+        Line::from("Enter your Discord user token to store it in Keychain and connect.".dim()),
+        Line::raw(""),
+        Line::from(vec![" Token: ".bold().cyan(), Span::raw(masked_input)]),
+        Line::raw(""),
+        Line::from("Enter: save to Keychain and connect".dim()),
+        Line::from("Esc: continue in mock mode".dim()),
+    ];
+
+    if let Some(error) = prompt.error.as_deref() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(error.to_string(), theme::error())));
+    }
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(theme::focused_border())
+                .title(" Setup ".bold().cyan()),
         )
         .wrap(Wrap { trim: false });
 

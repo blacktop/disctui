@@ -1,14 +1,28 @@
+use std::collections::HashMap;
+
+pub const DIRECT_MESSAGES_GUILD_ID: &str = "@me";
+pub const DIRECT_MESSAGES_GUILD_NAME: &str = "Direct Messages";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChannelKind {
     Category,
     Text,
     #[cfg_attr(not(feature = "experimental-discord"), expect(dead_code))]
     Announcement,
+    DirectMessage,
 }
 
 impl ChannelKind {
     pub const fn is_selectable(self) -> bool {
         !matches!(self, Self::Category)
+    }
+
+    pub const fn marker(self) -> &'static str {
+        match self {
+            Self::Category => "",
+            Self::Text | Self::Announcement => "#",
+            Self::DirectMessage => "@",
+        }
     }
 }
 
@@ -16,6 +30,7 @@ impl ChannelKind {
 pub struct GuildSummary {
     pub id: String,
     pub name: String,
+    pub muted: bool,
     pub unread: bool,
     pub unread_count: u32,
     pub avatar_url: Option<String>,
@@ -24,10 +39,6 @@ pub struct GuildSummary {
 #[derive(Debug, Clone)]
 pub struct ChannelSummary {
     pub id: String,
-    #[expect(
-        dead_code,
-        reason = "used in live transport normalization and future guild rail views"
-    )]
     pub guild_id: Option<String>,
     #[cfg_attr(not(feature = "experimental-discord"), expect(dead_code))]
     pub parent_id: Option<String>,
@@ -35,10 +46,33 @@ pub struct ChannelSummary {
     pub kind: ChannelKind,
     #[cfg_attr(not(feature = "experimental-discord"), expect(dead_code))]
     pub position: i32,
+    pub muted: bool,
     pub unread: bool,
     pub unread_count: u32,
     /// Last message ID in this channel (from Discord), used for mark-all-read persistence.
     pub last_message_id: Option<String>,
+}
+
+impl ChannelSummary {
+    pub const fn is_effectively_muted(&self, guild_muted: bool) -> bool {
+        guild_muted || self.muted
+    }
+
+    pub const fn shows_unread(&self, guild_muted: bool) -> bool {
+        self.unread && !self.is_effectively_muted(guild_muted)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct GuildMuteSettings {
+    pub guild_id: String,
+    pub muted: bool,
+    pub channel_overrides: HashMap<String, ChannelMuteOverride>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ChannelMuteOverride {
+    pub muted: bool,
 }
 
 #[derive(Debug, Clone)]

@@ -42,12 +42,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         &mut app.avatars,
     );
 
+    let selected_guild_muted = app.selected_guild_muted();
     channels::render(
         frame,
         channel_area,
         &app.channels,
         &mut app.channel_state,
         app.focus == FocusPane::Channels,
+        selected_guild_muted,
         app.selected_channel_id.as_deref(),
     );
 
@@ -98,11 +100,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         app.input_mode,
         app.focus,
         app.connection_state,
-        app.selected_channel_name(),
+        app.selected_channel_name().zip(app.selected_channel_kind()),
         app.status_error(),
     );
 
-    if app.show_help {
+    if let Some(prompt) = app.discord_token_prompt() {
+        popup::render_discord_token_prompt(frame, frame.area(), prompt);
+    } else if app.show_help {
         popup::render_help(frame, frame.area());
     }
 }
@@ -138,20 +142,36 @@ pub(super) fn truncate_name(name: &str, max_width: usize) -> String {
 fn render_header(frame: &mut Frame, area: ratatui::layout::Rect, app: &App) {
     let guild = app.selected_guild_name().unwrap_or("");
     let channel = app.selected_channel_name().unwrap_or("");
+    let channel_marker = app
+        .selected_channel_kind()
+        .map_or("#", |kind| kind.marker());
+    let channel_suffix = if app.selected_channel_directly_muted() {
+        format!(" {}", theme::MUTE_GLYPH)
+    } else {
+        String::new()
+    };
+    let selected_guild_label = if app.selected_guild_muted() {
+        format!("{guild} {}", theme::MUTE_GLYPH)
+    } else {
+        guild.to_string()
+    };
 
     let line = if guild.is_empty() && channel.is_empty() {
         Line::from(Span::styled(" disctui", theme::dim()))
     } else if channel.is_empty() {
         Line::from(vec![
             Span::raw(" "),
-            Span::styled(guild.to_string(), theme::selected_item()),
+            Span::styled(selected_guild_label, theme::selected_item()),
         ])
     } else {
         Line::from(vec![
             Span::raw(" "),
-            Span::styled(guild.to_string(), theme::dim()),
+            Span::styled(selected_guild_label, theme::dim()),
             Span::styled(" \u{203a} ", theme::dim()),
-            Span::styled(format!("#{channel}"), theme::selected_item()),
+            Span::styled(
+                format!("{channel_marker}{channel}{channel_suffix}"),
+                theme::selected_item(),
+            ),
         ])
     };
 

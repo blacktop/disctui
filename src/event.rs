@@ -27,7 +27,7 @@ fn map_key_event(key: &KeyEvent, mode: InputMode, focus: FocusPane) -> Option<Ac
     }
 }
 
-fn map_normal_mode(key: &KeyEvent, _focus: FocusPane) -> Option<Action> {
+fn map_normal_mode(key: &KeyEvent, focus: FocusPane) -> Option<Action> {
     // Ctrl-D / Ctrl-U for half-page scroll
     if key.modifiers.contains(KeyModifiers::CONTROL) {
         return match key.code {
@@ -41,6 +41,8 @@ fn map_normal_mode(key: &KeyEvent, _focus: FocusPane) -> Option<Action> {
         KeyCode::Char('q') => Some(Action::Quit),
         KeyCode::Char('j') | KeyCode::Down => Some(Action::MoveDown),
         KeyCode::Char('k') | KeyCode::Up => Some(Action::MoveUp),
+        KeyCode::Left => Some(Action::SetFocus(focus_left(focus))),
+        KeyCode::Right => Some(Action::SetFocus(focus_right(focus))),
         KeyCode::PageDown => Some(Action::ScrollDown(30)),
         KeyCode::PageUp => Some(Action::ScrollUp(30)),
         KeyCode::Char('g') => Some(Action::JumpTop),
@@ -60,6 +62,22 @@ fn map_normal_mode(key: &KeyEvent, _focus: FocusPane) -> Option<Action> {
     }
 }
 
+fn focus_left(focus: FocusPane) -> FocusPane {
+    match focus {
+        FocusPane::Guilds => FocusPane::Messages,
+        FocusPane::Channels => FocusPane::Guilds,
+        FocusPane::Messages | FocusPane::Input => FocusPane::Channels,
+    }
+}
+
+fn focus_right(focus: FocusPane) -> FocusPane {
+    match focus {
+        FocusPane::Guilds => FocusPane::Channels,
+        FocusPane::Channels => FocusPane::Messages,
+        FocusPane::Messages | FocusPane::Input => FocusPane::Guilds,
+    }
+}
+
 fn map_insert_mode(key: &KeyEvent) -> Option<Action> {
     match key.code {
         KeyCode::Esc => Some(Action::ExitInsert),
@@ -68,5 +86,30 @@ fn map_insert_mode(key: &KeyEvent) -> Option<Action> {
         }
         // All other keys are handled by the textarea widget directly
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn left_arrow_cycles_focus_across_main_panes() {
+        assert_eq!(focus_left(FocusPane::Messages), FocusPane::Channels);
+        assert_eq!(focus_left(FocusPane::Channels), FocusPane::Guilds);
+        assert_eq!(focus_left(FocusPane::Guilds), FocusPane::Messages);
+    }
+
+    #[test]
+    fn right_arrow_cycles_focus_across_main_panes() {
+        assert_eq!(focus_right(FocusPane::Messages), FocusPane::Guilds);
+        assert_eq!(focus_right(FocusPane::Guilds), FocusPane::Channels);
+        assert_eq!(focus_right(FocusPane::Channels), FocusPane::Messages);
+    }
+
+    #[test]
+    fn input_focus_uses_message_column_for_horizontal_navigation() {
+        assert_eq!(focus_left(FocusPane::Input), FocusPane::Channels);
+        assert_eq!(focus_right(FocusPane::Input), FocusPane::Guilds);
     }
 }

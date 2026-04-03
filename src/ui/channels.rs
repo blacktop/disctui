@@ -6,6 +6,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 
 use crate::model::{ChannelKind, ChannelSummary};
 use crate::ui::theme;
+use crate::ui::truncate_name;
 
 pub fn render(
     frame: &mut Frame,
@@ -13,6 +14,7 @@ pub fn render(
     channels: &[ChannelSummary],
     state: &mut ListState,
     focused: bool,
+    guild_muted: bool,
     selected_channel_id: Option<&str>,
 ) {
     let border_style = if focused {
@@ -36,17 +38,24 @@ pub fn render(
             } else {
                 let max_name = area.width.saturating_sub(10) as usize;
                 let name = truncate_name(&ch.name, max_name);
+                let marker = ch.kind.marker();
+                let mute_marker = ch
+                    .muted
+                    .then(|| Span::styled(format!(" {}", theme::MUTE_GLYPH), theme::muted()));
 
-                if ch.unread {
+                if ch.shows_unread(guild_muted) {
                     let mut spans = vec![
                         Span::styled("  \u{25cf} ", theme::unread()), // bold cyan dot
                         Span::styled(
-                            format!("# {name}"),
+                            format!("{marker} {name}"),
                             Style::new()
                                 .fg(ratatui::style::Color::White)
                                 .add_modifier(Modifier::BOLD),
                         ),
                     ];
+                    if let Some(marker) = mute_marker.clone() {
+                        spans.push(marker);
+                    }
                     if ch.unread_count > 0 {
                         spans.push(Span::styled(
                             format!(" ({})", ch.unread_count),
@@ -55,8 +64,12 @@ pub fn render(
                     }
                     ListItem::new(Line::from(spans))
                 } else {
-                    let label = format!("    # {name}");
-                    ListItem::new(Line::from(label.dim()))
+                    let mut spans =
+                        vec![Span::styled(format!("    {marker} {name}"), theme::dim())];
+                    if let Some(marker) = mute_marker {
+                        spans.push(marker);
+                    }
+                    ListItem::new(Line::from(spans))
                 }
             }
         })
@@ -68,9 +81,15 @@ pub fn render(
         .count();
     let title = match selected_channel_id.and_then(|id| channels.iter().find(|ch| ch.id == id)) {
         Some(selected) => format!(
-            " Channels {} · #{} ",
+            " Channels {} · {}{}{} ",
             selectable_count,
-            truncate_name(&selected.name, 16)
+            selected.kind.marker(),
+            truncate_name(&selected.name, 16),
+            if selected.muted {
+                format!(" {}", theme::MUTE_GLYPH)
+            } else {
+                String::new()
+            }
         ),
         None => format!(" Channels {selectable_count} "),
     };
@@ -87,5 +106,3 @@ pub fn render(
 
     frame.render_stateful_widget(list, area, state);
 }
-
-use super::truncate_name;

@@ -19,15 +19,21 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio::time::interval;
+#[cfg(feature = "experimental-discord")]
+use zeroize::Zeroize;
 
 use crate::action::Action;
 use crate::ai::Summarizer;
 use crate::ai::SummarizerBackend;
 use crate::ai::claude::ClaudeSummarizer;
 use crate::ai::local::LocalSummarizer;
-use crate::app::{App, ConnectionState, InputMode};
+#[cfg(feature = "experimental-discord")]
+use crate::app::ConnectionState;
+use crate::app::{App, InputMode};
 use crate::config::AppConfig;
 use crate::effect::Effect;
+#[cfg(feature = "experimental-discord")]
+use crate::model::DIRECT_MESSAGES_GUILD_ID;
 use crate::transport::mock;
 
 const ACTION_CHANNEL_CAPACITY: usize = 512;
@@ -93,55 +99,65 @@ async fn run(
     tick.tick().await;
 
     #[cfg(feature = "experimental-discord")]
-    let discord = try_connect_discord(&action_tx);
+    let mut discord = None;
     #[cfg(feature = "experimental-discord")]
-    let use_discord = discord.is_some();
-    #[cfg(not(feature = "experimental-discord"))]
-    let use_discord = false;
-
-    if use_discord {
-        app.connection_state = ConnectionState::Connecting;
-    } else {
-        let init = App::init_effects();
-        for effect in init {
-            execute_effect_mock(effect, &action_tx, ai_backend.as_ref());
+    let mut transport_started = false;
+    #[cfg(feature = "experimental-discord")]
+    match auth::get_token() {
+        Ok(token) => match connect_discord_with_token(&token, &action_tx) {
+            Ok(state) => {
+                discord = Some(state);
+                app.connection_state = ConnectionState::Connecting;
+                transport_started = true;
+            }
+            Err(err) => {
+                tracing::error!("failed to connect to discord: {err}");
+                app.show_discord_token_prompt();
+                app.set_discord_token_prompt_error(format!("Saved token failed to connect: {err}"));
+            }
+        },
+        Err(err) => {
+            tracing::info!("discord token unavailable at startup: {err}");
+            app.show_discord_token_prompt();
         }
+    }
+    #[cfg(not(feature = "experimental-discord"))]
+    {
+        start_mock_transport(&action_tx, ai_backend.as_ref());
     }
 
     loop {
         terminal.draw(|frame| ui::render(frame, &mut app))?;
 
         let action = tokio::select! {
-            Some(Ok(evt)) = term_events.next() => {
-                let mapped = event::map_terminal_event(&evt, app.input_mode, app.focus);
-                if mapped.is_none() && app.input_mode == InputMode::Insert {
-                    handle_insert_input(&evt, &mut app);
-                }
-                mapped
-            }
+            Some(Ok(evt)) = term_events.next() => map_runtime_event(&evt, &mut app),
             Some(action) = action_rx.recv() => Some(action),
             _ = tick.tick() => Some(Action::Tick),
         };
 
         if let Some(action) = action {
-            let effects = app.update(action);
-            dispatch_effects(
-                effects,
+            process_action(
+                action,
+                &mut app,
                 &action_tx,
                 ai_backend.as_ref(),
                 #[cfg(feature = "experimental-discord")]
-                discord.as_ref(),
+                &mut discord,
+                #[cfg(feature = "experimental-discord")]
+                &mut transport_started,
             );
         }
 
         while let Ok(action) = action_rx.try_recv() {
-            let effects = app.update(action);
-            dispatch_effects(
-                effects,
+            process_action(
+                action,
+                &mut app,
                 &action_tx,
                 ai_backend.as_ref(),
                 #[cfg(feature = "experimental-discord")]
-                discord.as_ref(),
+                &mut discord,
+                #[cfg(feature = "experimental-discord")]
+                &mut transport_started,
             );
         }
 
@@ -158,6 +174,49 @@ async fn run(
     }
 
     Ok(())
+}
+
+fn start_mock_transport(tx: &mpsc::Sender<Action>, ai_backend: Option<&SummarizerBackend>) {
+    for effect in App::init_effects() {
+        execute_effect_mock(effect, tx, ai_backend);
+    }
+}
+
+fn map_runtime_event(evt: &Event, app: &mut App) -> Option<Action> {
+    #[cfg(feature = "experimental-discord")]
+    if app.has_discord_token_prompt() {
+        return map_discord_token_prompt_event(evt, app);
+    }
+
+    let mapped = event::map_terminal_event(evt, app.input_mode, app.focus);
+    if mapped.is_none() && app.input_mode == InputMode::Insert {
+        handle_insert_input(evt, app);
+    }
+    mapped
+}
+
+fn process_action(
+    action: Action,
+    app: &mut App,
+    tx: &mpsc::Sender<Action>,
+    ai_backend: Option<&SummarizerBackend>,
+    #[cfg(feature = "experimental-discord")] discord: &mut Option<DiscordState>,
+    #[cfg(feature = "experimental-discord")] transport_started: &mut bool,
+) {
+    #[cfg(feature = "experimental-discord")]
+    if handle_discord_token_prompt_action(&action, app, tx, ai_backend, discord, transport_started)
+    {
+        return;
+    }
+
+    let effects = app.update(action);
+    dispatch_effects(
+        effects,
+        tx,
+        ai_backend,
+        #[cfg(feature = "experimental-discord")]
+        discord.as_ref(),
+    );
 }
 
 fn dispatch_effects(
@@ -244,23 +303,43 @@ fn execute_effect_discord(
             // Channels usually arrive via GUILD_CREATE and are cached in app.guild_channels.
             // This fallback uses REST if needed.
             let http = ds.client.http().clone();
+            let cache = ds.client.cache().clone();
             let tx = tx.clone();
             tokio::spawn(async move {
-                let url = format!("https://discord.com/api/v10/guilds/{guild_id}/channels");
-                let action = match http.get(&url).await {
-                    Ok(value) => {
-                        let channels: Vec<diself::Channel> =
-                            serde_json::from_value(value).unwrap_or_default();
-                        let summaries: Vec<_> = channels
-                            .iter()
-                            .filter_map(transport::discord::channel_to_summary)
-                            .collect();
-                        Action::ChannelsLoaded {
-                            guild_id: Some(guild_id),
-                            channels: summaries,
+                let action = if guild_id == DIRECT_MESSAGES_GUILD_ID {
+                    let manager = diself::ChannelsManager;
+                    match manager.dm_channels(&http).await {
+                        Ok(channels) => {
+                            let mut summaries =
+                                transport::discord::channels_to_summaries(&channels);
+                            transport::discord::apply_read_state_from_cache(&mut summaries, &cache);
+                            Action::ChannelsLoaded {
+                                guild_id: Some(guild_id),
+                                channels: summaries,
+                            }
                         }
+                        Err(e) => Action::Error(format!("failed to load direct messages: {e}")),
                     }
-                    Err(e) => Action::Error(format!("failed to load channels: {e}")),
+                } else {
+                    let url = format!("https://discord.com/api/v10/guilds/{guild_id}/channels");
+                    match http.get(&url).await {
+                        Ok(value) => match serde_json::from_value::<Vec<diself::Channel>>(value) {
+                            Ok(channels) => {
+                                let mut summaries =
+                                    transport::discord::channels_to_summaries(&channels);
+                                transport::discord::apply_read_state_from_cache(
+                                    &mut summaries,
+                                    &cache,
+                                );
+                                Action::ChannelsLoaded {
+                                    guild_id: Some(guild_id),
+                                    channels: summaries,
+                                }
+                            }
+                            Err(e) => Action::Error(format!("failed to decode channel list: {e}")),
+                        },
+                        Err(e) => Action::Error(format!("failed to load channels: {e}")),
+                    }
                 };
                 let _ = tx.send(action).await;
             });
@@ -315,22 +394,10 @@ fn execute_effect_discord(
 }
 
 #[cfg(feature = "experimental-discord")]
-fn try_connect_discord(tx: &mpsc::Sender<Action>) -> Option<DiscordState> {
-    let token = match auth::get_token() {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::info!("no discord token, using mock transport: {e}");
-            return None;
-        }
-    };
+fn connect_discord_with_token(token: &str, tx: &mpsc::Sender<Action>) -> Result<DiscordState> {
     auth::log_tos_warning();
-    match transport::discord::connect(token, tx.clone()) {
-        Ok((client, handle)) => Some(DiscordState { client, handle }),
-        Err(e) => {
-            tracing::error!("failed to connect to discord: {e}");
-            None
-        }
-    }
+    let (client, handle) = transport::discord::connect(token.to_string(), tx.clone())?;
+    Ok(DiscordState { client, handle })
 }
 
 // --- Shared: AI summarization ---
@@ -412,5 +479,96 @@ fn handle_insert_input(evt: &Event, app: &mut App) {
             app.input_text.push('\n');
         }
         _ => {}
+    }
+}
+
+#[cfg(feature = "experimental-discord")]
+fn map_discord_token_prompt_event(evt: &Event, app: &mut App) -> Option<Action> {
+    match evt {
+        Event::Resize(width, height) => Some(Action::Resize {
+            width: *width,
+            height: *height,
+        }),
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                return Some(Action::Quit);
+            }
+
+            match key.code {
+                KeyCode::Enter => Some(Action::SubmitDiscordToken),
+                KeyCode::Esc => Some(Action::CancelDiscordToken),
+                KeyCode::Backspace => {
+                    app.pop_discord_token_prompt_char();
+                    None
+                }
+                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.push_discord_token_prompt_char(ch);
+                    None
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "experimental-discord")]
+fn handle_discord_token_prompt_action(
+    action: &Action,
+    app: &mut App,
+    tx: &mpsc::Sender<Action>,
+    ai_backend: Option<&SummarizerBackend>,
+    discord: &mut Option<DiscordState>,
+    transport_started: &mut bool,
+) -> bool {
+    if !app.has_discord_token_prompt() {
+        return false;
+    }
+
+    match action {
+        Action::SubmitDiscordToken => {
+            let Some(mut token) = app.take_discord_token_prompt_input() else {
+                return true;
+            };
+
+            if let Err(err) = auth::store_token(&token) {
+                app.set_discord_token_prompt_error(err.to_string());
+                token.zeroize();
+                return true;
+            }
+
+            match connect_discord_with_token(&token, tx) {
+                Ok(state) => {
+                    app.dismiss_discord_token_prompt();
+                    let _ = app.update(Action::TransportConnecting);
+                    *discord = Some(state);
+                    *transport_started = true;
+                }
+                Err(err) => {
+                    app.set_discord_token_prompt_error(format!("Failed to connect: {err}"));
+                }
+            }
+
+            token.zeroize();
+            true
+        }
+        Action::CancelDiscordToken => {
+            app.dismiss_discord_token_prompt();
+            if !*transport_started {
+                start_mock_transport(tx, ai_backend);
+                *transport_started = true;
+            }
+            app.connection_state = ConnectionState::MockTransport;
+            true
+        }
+        Action::Quit => {
+            let _ = app.update(Action::Quit);
+            true
+        }
+        Action::Tick | Action::Resize { .. } => {
+            let _ = app.update(action.clone());
+            true
+        }
+        _ => true,
     }
 }

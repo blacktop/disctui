@@ -6,7 +6,10 @@ use ratatui::widgets::ListState;
 
 use crate::action::Action;
 use crate::effect::Effect;
-use crate::model::{ChannelDigest, ChannelSummary, GuildSummary, MessageRow};
+use crate::model::{
+    ChannelDigest, ChannelKind, ChannelSummary, DIRECT_MESSAGES_GUILD_ID,
+    DIRECT_MESSAGES_GUILD_NAME, GuildMuteSettings, GuildSummary, MessageRow,
+};
 use crate::store::{self, Store};
 use crate::ui::media::AvatarStore;
 
@@ -79,12 +82,19 @@ pub struct SummaryPaneState {
     pub last_digest: Option<ChannelDigest>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct DiscordTokenPromptState {
+    pub input: String,
+    pub error: Option<String>,
+}
+
 #[expect(clippy::struct_excessive_bools, reason = "independent UI state flags")]
 pub struct App {
     pub input_mode: InputMode,
     pub focus: FocusPane,
     pub should_quit: bool,
     pub show_help: bool,
+    discord_token_prompt: Option<DiscordTokenPromptState>,
     pub connection_state: ConnectionState,
     pub guilds: Vec<GuildSummary>,
     pub guild_state: ListState,
@@ -112,6 +122,8 @@ pub struct App {
     read_watermark: usize,
     /// Channels per guild, populated from `GUILD_CREATE` events.
     guild_channels: HashMap<String, Vec<ChannelSummary>>,
+    /// User mute preferences from Discord notification settings.
+    guild_mute_settings: HashMap<String, GuildMuteSettings>,
     /// Tick counter for periodic refresh (every ~10s at 250ms tick rate).
     tick_count: u32,
     pub avatars: AvatarStore,
@@ -129,6 +141,7 @@ impl App {
             focus: FocusPane::Guilds,
             should_quit: false,
             show_help: false,
+            discord_token_prompt: None,
             connection_state: ConnectionState::MockTransport,
             guilds: Vec::new(),
             guild_state: ListState::default(),
@@ -150,6 +163,7 @@ impl App {
             store: None,
             read_watermark: 0,
             guild_channels: HashMap::new(),
+            guild_mute_settings: HashMap::new(),
             tick_count: 0,
             avatars,
         }
@@ -161,7 +175,22 @@ impl App {
     }
 
     /// Process an action. Returns effects to execute asynchronously.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "central app reducer keeps modal and pane transitions in one match"
+    )]
     pub fn update(&mut self, action: Action) -> Vec<Effect> {
+        // Startup token prompt is modal: only allow quitting, ticks, and resizes.
+        if self.discord_token_prompt.is_some() {
+            match action {
+                Action::Quit => {}
+                Action::Tick | Action::Resize { .. } => {
+                    return self.tick();
+                }
+                _ => return Vec::new(),
+            }
+        }
+
         // Help popup is modal: only allow closing it, quitting, ticks, and resizes
         if self.show_help {
             match action {
@@ -176,7 +205,7 @@ impl App {
         match action {
             Action::Quit => self.should_quit = true,
             Action::Tick => return self.tick(),
-            Action::Resize { .. } => {}
+            Action::Resize { .. } | Action::SubmitDiscordToken | Action::CancelDiscordToken => {}
             Action::FocusNext => self.focus = self.focus.next(),
             Action::FocusPrev => self.focus = self.focus.prev(),
             Action::SetFocus(pane) => self.focus = pane,
@@ -229,12 +258,16 @@ impl App {
             Action::ReadyData {
                 guilds,
                 guild_channels,
-            } => return self.handle_ready_data(guilds, guild_channels),
+                guild_mute_settings,
+            } => return self.handle_ready_data(guilds, guild_channels, guild_mute_settings),
             Action::GuildAvailable { guild, channels } => {
                 return self.handle_guild_available(guild, channels);
             }
+            Action::GuildMuteSettingsUpdated(settings) => {
+                self.handle_guild_mute_settings_updated(settings);
+            }
             Action::ChannelsLoaded { guild_id, channels } => {
-                self.handle_channels_loaded(guild_id.as_deref(), channels);
+                return self.handle_channels_loaded(guild_id.as_deref(), channels);
             }
             Action::HistoryLoaded {
                 messages,
@@ -269,6 +302,34 @@ impl App {
             .map(|ch| ch.name.as_str())
     }
 
+    pub fn selected_channel_kind(&self) -> Option<ChannelKind> {
+        let id = self.selected_channel_id.as_deref()?;
+        self.channels
+            .iter()
+            .find(|ch| ch.id == id)
+            .map(|ch| ch.kind)
+    }
+
+    pub fn selected_guild_muted(&self) -> bool {
+        let Some(id) = self.selected_guild_id.as_deref() else {
+            return false;
+        };
+        self.guilds
+            .iter()
+            .find(|guild| guild.id == id)
+            .is_some_and(|guild| guild.muted)
+    }
+
+    pub fn selected_channel_directly_muted(&self) -> bool {
+        let Some(id) = self.selected_channel_id.as_deref() else {
+            return false;
+        };
+        self.channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .is_some_and(|channel| channel.muted)
+    }
+
     pub fn selected_guild_name(&self) -> Option<&str> {
         let id = self.selected_guild_id.as_deref()?;
         self.guilds
@@ -279,6 +340,81 @@ impl App {
 
     pub fn status_error(&self) -> Option<&str> {
         self.status_error.as_ref().map(|(msg, _)| msg.as_str())
+    }
+
+    pub fn discord_token_prompt(&self) -> Option<&DiscordTokenPromptState> {
+        self.discord_token_prompt.as_ref()
+    }
+
+    pub fn has_discord_token_prompt(&self) -> bool {
+        self.discord_token_prompt.is_some()
+    }
+
+    pub fn show_discord_token_prompt(&mut self) {
+        self.discord_token_prompt = Some(DiscordTokenPromptState::default());
+        self.input_mode = InputMode::Normal;
+        self.show_help = false;
+        self.connection_state = ConnectionState::Disconnected;
+    }
+
+    #[cfg_attr(
+        not(feature = "experimental-discord"),
+        expect(
+            dead_code,
+            reason = "startup token prompt is only compiled into Discord builds"
+        )
+    )]
+    pub fn dismiss_discord_token_prompt(&mut self) {
+        self.discord_token_prompt = None;
+    }
+
+    pub fn push_discord_token_prompt_char(&mut self, ch: char) {
+        let Some(prompt) = self.discord_token_prompt.as_mut() else {
+            return;
+        };
+        prompt.input.push(ch);
+        prompt.error = None;
+    }
+
+    #[cfg_attr(
+        not(feature = "experimental-discord"),
+        expect(
+            dead_code,
+            reason = "startup token prompt is only compiled into Discord builds"
+        )
+    )]
+    pub fn pop_discord_token_prompt_char(&mut self) {
+        let Some(prompt) = self.discord_token_prompt.as_mut() else {
+            return;
+        };
+        prompt.input.pop();
+        prompt.error = None;
+    }
+
+    #[cfg_attr(
+        not(feature = "experimental-discord"),
+        expect(
+            dead_code,
+            reason = "startup token prompt is only compiled into Discord builds"
+        )
+    )]
+    pub fn set_discord_token_prompt_error(&mut self, error: String) {
+        let Some(prompt) = self.discord_token_prompt.as_mut() else {
+            return;
+        };
+        prompt.error = Some(error);
+    }
+
+    pub fn take_discord_token_prompt_input(&mut self) -> Option<String> {
+        let prompt = self.discord_token_prompt.as_mut()?;
+        let input = std::mem::take(&mut prompt.input);
+        let trimmed = input.trim().to_string();
+        if trimmed.is_empty() {
+            prompt.error = Some("Discord token is required".into());
+            return None;
+        }
+        prompt.error = None;
+        Some(trimmed)
     }
 
     fn request_avatar_effects<'a>(
@@ -298,6 +434,178 @@ impl App {
         self.status_error = Some((msg, Instant::now()));
     }
 
+    fn apply_local_read_state_to_channels(store: &Store, channels: &mut [ChannelSummary]) -> u32 {
+        let mut cleared = 0u32;
+
+        for channel in channels {
+            if !channel.unread {
+                continue;
+            }
+            let Some(last_message_id) = &channel.last_message_id else {
+                continue;
+            };
+
+            let is_read = store.last_read_message(&channel.id).is_some_and(|read_id| {
+                match (read_id.parse::<u64>(), last_message_id.parse::<u64>()) {
+                    (Ok(read_id), Ok(last_message_id)) => read_id >= last_message_id,
+                    _ => false,
+                }
+            });
+            if !is_read {
+                continue;
+            }
+
+            channel.unread = false;
+            channel.unread_count = 0;
+            cleared += 1;
+        }
+
+        cleared
+    }
+
+    fn ensure_direct_messages_guild(guilds: &mut Vec<GuildSummary>) {
+        if guilds
+            .iter()
+            .any(|guild| guild.id == DIRECT_MESSAGES_GUILD_ID)
+        {
+            return;
+        }
+
+        guilds.push(GuildSummary {
+            id: DIRECT_MESSAGES_GUILD_ID.to_string(),
+            name: DIRECT_MESSAGES_GUILD_NAME.to_string(),
+            muted: false,
+            unread: false,
+            unread_count: 0,
+            avatar_url: None,
+        });
+    }
+
+    fn maybe_load_direct_messages(&self, effects: &mut Vec<Effect>) {
+        if !self
+            .guilds
+            .iter()
+            .any(|guild| guild.id == DIRECT_MESSAGES_GUILD_ID)
+            || self.guild_channels.contains_key(DIRECT_MESSAGES_GUILD_ID)
+            || effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    Effect::LoadChannels { guild_id } if guild_id == DIRECT_MESSAGES_GUILD_ID
+                )
+            })
+        {
+            return;
+        }
+
+        effects.push(Effect::LoadChannels {
+            guild_id: DIRECT_MESSAGES_GUILD_ID.to_string(),
+        });
+    }
+
+    fn sync_guild_unread_from_channels(&mut self, guild_id: &str) {
+        let Some(guild) = self.guilds.iter_mut().find(|guild| guild.id == guild_id) else {
+            return;
+        };
+        let Some(channels) = self.guild_channels.get(guild_id) else {
+            return;
+        };
+        let guild_muted = guild.muted;
+
+        let total: u32 = channels
+            .iter()
+            .filter(|channel| channel.shows_unread(guild_muted))
+            .map(|channel| channel.unread_count.max(1))
+            .sum();
+        guild.unread = total > 0;
+        guild.unread_count = total;
+    }
+
+    fn apply_guild_mute_settings_to_channels(
+        guild_id: &str,
+        channels: &mut [ChannelSummary],
+        guild_mute_settings: &HashMap<String, GuildMuteSettings>,
+    ) {
+        let Some(settings) = guild_mute_settings.get(guild_id) else {
+            for channel in channels {
+                channel.muted = false;
+            }
+            return;
+        };
+
+        for channel in channels {
+            channel.muted = settings
+                .channel_overrides
+                .get(&channel.id)
+                .is_some_and(|override_settings| override_settings.muted);
+        }
+    }
+
+    fn apply_guild_mute_settings(
+        guilds: &mut [GuildSummary],
+        guild_channels: &mut HashMap<String, Vec<ChannelSummary>>,
+        guild_mute_settings: &HashMap<String, GuildMuteSettings>,
+    ) {
+        for guild in guilds.iter_mut() {
+            guild.muted = guild_mute_settings
+                .get(&guild.id)
+                .is_some_and(|settings| settings.muted);
+        }
+
+        for (guild_id, channels) in guild_channels.iter_mut() {
+            Self::apply_guild_mute_settings_to_channels(guild_id, channels, guild_mute_settings);
+        }
+    }
+
+    fn prepare_loaded_channels(&self, guild_id: &str, channels: &mut [ChannelSummary]) {
+        Self::apply_guild_mute_settings_to_channels(guild_id, channels, &self.guild_mute_settings);
+        if let Some(store) = self.store.as_deref() {
+            let _ = Self::apply_local_read_state_to_channels(store, channels);
+        }
+    }
+
+    fn update_visible_channels_mute_state(&mut self) {
+        let Some(guild_id) = self.selected_guild_id.as_deref() else {
+            return;
+        };
+        Self::apply_guild_mute_settings_to_channels(
+            guild_id,
+            &mut self.channels,
+            &self.guild_mute_settings,
+        );
+    }
+
+    fn restore_selected_channel_from_store(&mut self) -> Vec<Effect> {
+        let Some(store) = &self.store else {
+            self.session_restore_pending = false;
+            return Vec::new();
+        };
+
+        let guild_id = self.selected_guild_id.clone().unwrap_or_default();
+        self.session_restore_pending = false;
+
+        let Some(channel_id) = store.get_session(store::KEY_LAST_CHANNEL) else {
+            tracing::info!("restored session: guild={guild_id} (no channel restored)");
+            return Vec::new();
+        };
+
+        let Some(ch_idx) = self
+            .channels
+            .iter()
+            .position(|channel| channel.id == channel_id)
+        else {
+            tracing::info!(
+                "restored session: guild={guild_id} (stored channel missing: {channel_id})"
+            );
+            return Vec::new();
+        };
+
+        self.channel_state.select(Some(ch_idx));
+        self.selected_channel_id = Some(channel_id.clone());
+        self.focus = FocusPane::Messages;
+        tracing::info!("restored session: guild={guild_id}, channel={channel_id}");
+        vec![Effect::LoadHistory { channel_id }]
+    }
+
     /// Cross-reference gateway unread state with our local DB.
     /// If we've locally marked a channel as read (via R or opening it),
     /// and the DB's read position >= the channel's `last_message_id`,
@@ -307,37 +615,13 @@ impl App {
 
         let mut cleared = 0u32;
         for channels in self.guild_channels.values_mut() {
-            for ch in channels.iter_mut() {
-                if !ch.unread {
-                    continue;
-                }
-                let Some(last_msg) = &ch.last_message_id else {
-                    continue;
-                };
-                if store.last_read_message(&ch.id).is_some_and(|read_id| {
-                    match (read_id.parse::<u64>(), last_msg.parse::<u64>()) {
-                        (Ok(r), Ok(m)) => r >= m,
-                        _ => false,
-                    }
-                }) {
-                    ch.unread = false;
-                    ch.unread_count = 0;
-                    cleared += 1;
-                }
-            }
+            cleared += Self::apply_local_read_state_to_channels(store, channels);
         }
 
         // Recalculate guild unread from channel state
-        for guild in &mut self.guilds {
-            if let Some(channels) = self.guild_channels.get(&guild.id) {
-                let total: u32 = channels
-                    .iter()
-                    .filter(|c| c.unread)
-                    .map(|c| c.unread_count.max(1))
-                    .sum();
-                guild.unread = total > 0;
-                guild.unread_count = total;
-            }
+        let guild_ids: Vec<String> = self.guilds.iter().map(|guild| guild.id.clone()).collect();
+        for guild_id in guild_ids {
+            self.sync_guild_unread_from_channels(&guild_id);
         }
 
         if cleared > 0 {
@@ -369,17 +653,7 @@ impl App {
             if let Some(ch_idx) = self.first_selectable_channel_index() {
                 self.channel_state.select(Some(ch_idx));
             }
-
-            // Restore channel selection and load its messages
-            if let Some(channel_id) = store.get_session(store::KEY_LAST_CHANNEL)
-                && let Some(ch_idx) = self.channels.iter().position(|c| c.id == channel_id)
-            {
-                self.channel_state.select(Some(ch_idx));
-                self.selected_channel_id = Some(channel_id.clone());
-                self.focus = FocusPane::Messages;
-                tracing::info!("restored session: guild={guild_id}, channel={channel_id}");
-                return vec![Effect::LoadHistory { channel_id }];
-            }
+            return self.restore_selected_channel_from_store();
         }
 
         if !self.guild_channels.contains_key(&guild_id) {
@@ -556,6 +830,13 @@ impl App {
     }
 
     fn handle_guilds_loaded(&mut self, guilds: Vec<GuildSummary>) -> Vec<Effect> {
+        let mut guilds = guilds;
+        Self::ensure_direct_messages_guild(&mut guilds);
+        Self::apply_guild_mute_settings(
+            &mut guilds,
+            &mut self.guild_channels,
+            &self.guild_mute_settings,
+        );
         let mut effects = self.request_avatar_effects(
             guilds
                 .iter()
@@ -567,6 +848,7 @@ impl App {
         }
         let mut restore = self.restore_session();
         effects.append(&mut restore);
+        self.maybe_load_direct_messages(&mut effects);
         effects
     }
 
@@ -574,7 +856,13 @@ impl App {
         &mut self,
         guilds: Vec<GuildSummary>,
         channels: HashMap<String, Vec<ChannelSummary>>,
+        guild_mute_settings: HashMap<String, GuildMuteSettings>,
     ) -> Vec<Effect> {
+        let mut guilds = guilds;
+        let mut channels = channels;
+        Self::ensure_direct_messages_guild(&mut guilds);
+        self.guild_mute_settings = guild_mute_settings;
+        Self::apply_guild_mute_settings(&mut guilds, &mut channels, &self.guild_mute_settings);
         let mut effects = self.request_avatar_effects(
             guilds
                 .iter()
@@ -589,25 +877,33 @@ impl App {
         }
         let mut restore_effects = self.restore_session();
         effects.append(&mut restore_effects);
+        self.maybe_load_direct_messages(&mut effects);
         effects
     }
 
     fn handle_guild_available(
         &mut self,
-        guild: GuildSummary,
-        channels: Vec<ChannelSummary>,
+        mut guild: GuildSummary,
+        mut channels: Vec<ChannelSummary>,
     ) -> Vec<Effect> {
+        guild.muted = self
+            .guild_mute_settings
+            .get(&guild.id)
+            .is_some_and(|settings| settings.muted);
+        self.prepare_loaded_channels(&guild.id, &mut channels);
         let effects = self.request_avatar_effects(guild.avatar_url.as_deref());
         // Store channels for this guild
         self.guild_channels.insert(guild.id.clone(), channels);
 
         // Add guild if not already present
-        if !self.guilds.iter().any(|g| g.id == guild.id) {
+        let guild_id = guild.id.clone();
+        if !self.guilds.iter().any(|g| g.id == guild_id) {
             self.guilds.push(guild);
             if self.guilds.len() == 1 {
                 self.guild_state.select(Some(0));
             }
         }
+        self.sync_guild_unread_from_channels(&guild_id);
         // Retry pending session restore now that new channels are available
         if self.session_restore_pending {
             let mut restore = self.restore_session();
@@ -621,20 +917,58 @@ impl App {
         effects
     }
 
-    fn handle_channels_loaded(&mut self, guild_id: Option<&str>, channels: Vec<ChannelSummary>) {
-        if guild_id.is_some() && guild_id != self.selected_guild_id.as_deref() {
-            return;
+    fn handle_guild_mute_settings_updated(&mut self, settings: GuildMuteSettings) {
+        let guild_id = settings.guild_id.clone();
+        self.guild_mute_settings.insert(guild_id.clone(), settings);
+        let guild_muted = self
+            .guild_mute_settings
+            .get(&guild_id)
+            .is_some_and(|stored| stored.muted);
+
+        if let Some(guild) = self.guilds.iter_mut().find(|guild| guild.id == guild_id) {
+            guild.muted = guild_muted;
         }
+        if let Some(channels) = self.guild_channels.get_mut(&guild_id) {
+            Self::apply_guild_mute_settings_to_channels(
+                &guild_id,
+                channels,
+                &self.guild_mute_settings,
+            );
+        }
+        if self.selected_guild_id.as_deref() == Some(guild_id.as_str()) {
+            self.update_visible_channels_mute_state();
+        }
+        self.sync_guild_unread_from_channels(&guild_id);
+    }
+
+    fn handle_channels_loaded(
+        &mut self,
+        guild_id: Option<&str>,
+        mut channels: Vec<ChannelSummary>,
+    ) -> Vec<Effect> {
         // Persist into the per-guild cache so restore_session and unread tracking work
         if let Some(gid) = guild_id {
+            self.prepare_loaded_channels(gid, &mut channels);
             self.guild_channels
                 .insert(gid.to_string(), channels.clone());
+            self.sync_guild_unread_from_channels(gid);
         }
+
+        if guild_id.is_some() && guild_id != self.selected_guild_id.as_deref() {
+            return Vec::new();
+        }
+
         self.channels = channels;
         self.channel_state = ListState::default();
         if let Some(idx) = self.first_selectable_channel_index() {
             self.channel_state.select(Some(idx));
         }
+
+        if self.session_restore_pending && guild_id == self.selected_guild_id.as_deref() {
+            return self.restore_selected_channel_from_store();
+        }
+
+        Vec::new()
     }
 
     fn handle_history_loaded(
@@ -695,11 +1029,13 @@ impl App {
         // Message is for a non-active channel — mark it as unread and advance last_message_id
         let channel_id = &msg.channel_id;
         let msg_id = msg.id.clone();
+        let mut affected_guild_id: Option<String> = None;
         for channels in self.guild_channels.values_mut() {
             if let Some(ch) = channels.iter_mut().find(|c| c.id == *channel_id) {
                 ch.unread = true;
                 ch.unread_count = ch.unread_count.saturating_add(1);
                 ch.last_message_id = Some(msg_id.clone());
+                affected_guild_id.clone_from(&ch.guild_id);
                 break;
             }
         }
@@ -708,17 +1044,9 @@ impl App {
             ch.unread_count = ch.unread_count.saturating_add(1);
             ch.last_message_id = Some(msg_id.clone());
         }
-        // Mark the parent guild as unread
-        for guild in &mut self.guilds {
-            if self
-                .guild_channels
-                .get(&guild.id)
-                .is_some_and(|chs| chs.iter().any(|c| c.id == *channel_id))
-            {
-                guild.unread = true;
-                guild.unread_count = guild.unread_count.saturating_add(1);
-                break;
-            }
+        // Mark the parent guild as unread, respecting mute visibility rules.
+        if let Some(guild_id) = affected_guild_id {
+            self.sync_guild_unread_from_channels(&guild_id);
         }
 
         Vec::new()
@@ -734,12 +1062,14 @@ impl App {
         self.messages.retain(|m| m.id != message_id);
         // Decrement unread if the deleted message was in a background channel
         if self.selected_channel_id.as_deref() != Some(channel_id) {
+            let mut affected_guild_id: Option<String> = None;
             for channels in self.guild_channels.values_mut() {
                 if let Some(ch) = channels.iter_mut().find(|c| c.id == channel_id) {
                     ch.unread_count = ch.unread_count.saturating_sub(1);
                     if ch.unread_count == 0 {
                         ch.unread = false;
                     }
+                    affected_guild_id.clone_from(&ch.guild_id);
                     break;
                 }
             }
@@ -748,6 +1078,9 @@ impl App {
                 if ch.unread_count == 0 {
                     ch.unread = false;
                 }
+            }
+            if let Some(guild_id) = affected_guild_id {
+                self.sync_guild_unread_from_channels(&guild_id);
             }
         }
     }
@@ -905,6 +1238,9 @@ impl App {
             ch.unread = false;
             ch.unread_count = 0;
         }
+        if let Some(guild_id) = self.selected_guild_id.clone() {
+            self.sync_guild_unread_from_channels(&guild_id);
+        }
 
         self.selected_channel_id = Some(channel_id.clone());
         self.messages.clear();
@@ -974,6 +1310,7 @@ fn move_list_selection(state: &mut ListState, len: usize, delta: i32) {
 #[expect(clippy::unwrap_used, reason = "unwrap is fine in tests")]
 mod tests {
     use super::*;
+    use crate::model::{ChannelKind, DIRECT_MESSAGES_GUILD_ID};
     use crate::transport::mock;
 
     /// Helper: create an app with mock guilds pre-loaded.
@@ -1008,6 +1345,27 @@ mod tests {
             });
         }
         app
+    }
+
+    fn load_direct_messages(app: &mut App) -> String {
+        let dm_index = app
+            .guilds
+            .iter()
+            .position(|guild| guild.id == DIRECT_MESSAGES_GUILD_ID)
+            .unwrap();
+        app.guild_state.select(Some(dm_index));
+        app.focus = FocusPane::Guilds;
+
+        let effects = app.update(Action::OpenSelected);
+        assert!(matches!(
+            effects.first(),
+            Some(Effect::LoadChannels { guild_id }) if guild_id == DIRECT_MESSAGES_GUILD_ID
+        ));
+
+        match &effects[0] {
+            Effect::LoadChannels { guild_id } => guild_id.clone(),
+            _ => String::new(),
+        }
     }
 
     #[test]
@@ -1076,9 +1434,9 @@ mod tests {
         assert_eq!(app.guild_state.selected(), Some(3));
         // Clamp at end
         app.update(Action::MoveDown);
-        assert_eq!(app.guild_state.selected(), Some(3));
+        assert_eq!(app.guild_state.selected(), Some(app.guilds.len() - 1));
         app.update(Action::MoveUp);
-        assert_eq!(app.guild_state.selected(), Some(2));
+        assert_eq!(app.guild_state.selected(), Some(app.guilds.len() - 2));
     }
 
     #[test]
@@ -1114,12 +1472,13 @@ mod tests {
         app.update(Action::GuildsLoaded(vec![GuildSummary {
             id: "1".into(),
             name: "Test".into(),
+            muted: false,
             unread: false,
             unread_count: 0,
             avatar_url: None,
         }]));
         assert_eq!(app.guild_state.selected(), Some(0));
-        assert_eq!(app.guilds.len(), 1);
+        assert_eq!(app.guilds.len(), 2);
     }
 
     #[test]
@@ -1183,6 +1542,43 @@ mod tests {
     }
 
     #[test]
+    fn discord_token_prompt_is_modal_and_sets_disconnected_state() {
+        let mut app = app_with_guilds();
+        app.show_discord_token_prompt();
+
+        assert!(app.has_discord_token_prompt());
+        assert_eq!(app.connection_state, ConnectionState::Disconnected);
+
+        let focus_before = app.focus;
+        app.update(Action::FocusNext);
+        assert_eq!(app.focus, focus_before);
+    }
+
+    #[test]
+    fn discord_token_prompt_requires_non_empty_token() {
+        let mut app = App::new();
+        app.show_discord_token_prompt();
+
+        assert!(app.take_discord_token_prompt_input().is_none());
+        assert_eq!(
+            app.discord_token_prompt()
+                .and_then(|prompt| prompt.error.as_deref()),
+            Some("Discord token is required")
+        );
+
+        app.push_discord_token_prompt_char(' ');
+        app.push_discord_token_prompt_char('a');
+        app.push_discord_token_prompt_char('b');
+        app.push_discord_token_prompt_char('c');
+        app.push_discord_token_prompt_char(' ');
+
+        assert_eq!(
+            app.take_discord_token_prompt_input().as_deref(),
+            Some("abc")
+        );
+    }
+
+    #[test]
     fn set_focus_targets_specific_pane() {
         let mut app = App::new();
         app.update(Action::SetFocus(FocusPane::Messages));
@@ -1201,6 +1597,131 @@ mod tests {
         assert!(matches!(effects[0], Effect::LoadChannels { .. }));
         assert_eq!(app.focus, FocusPane::Channels);
         assert!(app.selected_guild_id.is_some());
+    }
+
+    #[test]
+    fn guilds_loaded_adds_direct_messages_bucket() {
+        let app = app_with_guilds();
+        assert!(
+            app.guilds
+                .iter()
+                .any(|guild| guild.id == DIRECT_MESSAGES_GUILD_ID)
+        );
+    }
+
+    #[test]
+    fn open_direct_messages_loads_private_channels() {
+        let mut app = app_with_guilds();
+        let guild_id = load_direct_messages(&mut app);
+        assert_eq!(
+            app.selected_guild_id.as_deref(),
+            Some(DIRECT_MESSAGES_GUILD_ID)
+        );
+        assert_eq!(guild_id, DIRECT_MESSAGES_GUILD_ID);
+
+        app.update(Action::ChannelsLoaded {
+            guild_id: Some(guild_id.clone()),
+            channels: mock::channels(&guild_id),
+        });
+
+        assert!(!app.channels.is_empty());
+        assert!(
+            app.channels
+                .iter()
+                .all(|channel| channel.kind == ChannelKind::DirectMessage)
+        );
+    }
+
+    #[test]
+    fn direct_messages_loaded_applies_local_read_state() {
+        let mut app = app_with_guilds();
+        app.store = Some(std::rc::Rc::new(Store::open_in_memory()));
+
+        let guild_id = load_direct_messages(&mut app);
+        let mut channels = mock::channels(&guild_id);
+        let first_dm = channels
+            .iter_mut()
+            .find(|channel| channel.id == "dm1")
+            .unwrap();
+        first_dm.last_message_id = Some("100".into());
+
+        app.store
+            .as_ref()
+            .unwrap()
+            .mark_read(&first_dm.id, first_dm.last_message_id.as_deref().unwrap());
+
+        app.update(Action::ChannelsLoaded {
+            guild_id: Some(guild_id.clone()),
+            channels,
+        });
+
+        let dm = app
+            .channels
+            .iter()
+            .find(|channel| channel.id == "dm1")
+            .unwrap();
+        assert!(!dm.unread);
+        assert_eq!(dm.unread_count, 0);
+    }
+
+    #[test]
+    fn muted_guild_hides_non_mention_unread_indicators() {
+        let mut app = app_with_guilds();
+        app.focus = FocusPane::Guilds;
+        let effects = app.update(Action::OpenSelected);
+        if let Some(Effect::LoadChannels { guild_id }) = effects.first() {
+            let mut channels = mock::channels(guild_id);
+            for channel in &mut channels {
+                channel.unread = false;
+                channel.unread_count = 0;
+            }
+            if let Some(channel) = channels
+                .iter_mut()
+                .find(|channel| channel.kind.is_selectable())
+            {
+                channel.unread = true;
+                channel.unread_count = 7;
+            }
+            app.update(Action::ChannelsLoaded {
+                guild_id: Some(guild_id.clone()),
+                channels,
+            });
+        }
+
+        app.update(Action::GuildMuteSettingsUpdated(GuildMuteSettings {
+            guild_id: "g1".into(),
+            muted: true,
+            channel_overrides: HashMap::new(),
+        }));
+
+        assert!(
+            app.guilds
+                .iter()
+                .find(|guild| guild.id == "g1")
+                .unwrap()
+                .muted
+        );
+        assert_eq!(
+            app.guilds
+                .iter()
+                .find(|guild| guild.id == "g1")
+                .unwrap()
+                .unread_count,
+            0
+        );
+        assert!(
+            app.channels
+                .iter()
+                .all(|channel| !channel.shows_unread(app.selected_guild_muted()))
+        );
+        assert_eq!(
+            app.channels
+                .iter()
+                .find(|channel| channel.kind.is_selectable())
+                .unwrap()
+                .unread_count,
+            7
+        );
     }
 
     #[test]

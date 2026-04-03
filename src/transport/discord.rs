@@ -8,7 +8,10 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
 use crate::action::Action;
-use crate::model::{AttachmentSummary, ChannelKind, ChannelSummary, GuildSummary, MessageRow};
+use crate::model::{
+    AttachmentSummary, ChannelKind, ChannelSummary, DIRECT_MESSAGES_GUILD_ID, GuildMuteSettings,
+    GuildSummary, MessageRow,
+};
 
 pub struct DiscordBridge {
     tx: mpsc::Sender<Action>,
@@ -34,6 +37,22 @@ impl DiscordBridge {
 
 #[async_trait]
 impl EventHandler for DiscordBridge {
+    async fn on_gateway_payload(&self, _ctx: &Context, payload: &serde_json::Value) {
+        let is_dispatch = payload.get("op").and_then(serde_json::Value::as_u64) == Some(0);
+        let is_settings_update = payload.get("t").and_then(serde_json::Value::as_str)
+            == Some("USER_GUILD_SETTINGS_UPDATE");
+        if !is_dispatch || !is_settings_update {
+            return;
+        }
+
+        let Some(data) = payload.get("d") else {
+            return;
+        };
+        self.send(Action::GuildMuteSettingsUpdated(
+            parse_user_guild_mute_setting(data),
+        ));
+    }
+
     async fn on_ready(&self, _ctx: &Context, user: User) {
         let username = user
             .global_name
@@ -53,6 +72,7 @@ impl EventHandler for DiscordBridge {
 
         let mut guild_summaries = Vec::new();
         let mut all_channels = std::collections::HashMap::new();
+        let guild_mute_settings = parse_user_guild_mute_settings(&data);
 
         for guild in guilds_json {
             let props = guild.get("properties").unwrap_or(guild);
@@ -118,6 +138,7 @@ impl EventHandler for DiscordBridge {
         self.send(Action::ReadyData {
             guilds: guild_summaries,
             guild_channels: all_channels,
+            guild_mute_settings,
         });
     }
 
@@ -343,6 +364,7 @@ fn parse_channels_from_json(arr: &[serde_json::Value], guild_id: &str) -> Vec<Ch
                     .and_then(serde_json::Value::as_i64)
                     .and_then(|value| i32::try_from(value).ok())
                     .unwrap_or_default(),
+                muted: false,
                 unread: false,
                 unread_count: 0,
                 last_message_id: ch
@@ -358,29 +380,162 @@ fn parse_channels_from_json(arr: &[serde_json::Value], guild_id: &str) -> Vec<Ch
 
 pub fn channel_to_summary(ch: &diself::Channel) -> Option<ChannelSummary> {
     use diself::model::ChannelType;
+    let is_direct_message = matches!(ch.kind, ChannelType::DM | ChannelType::GroupDM);
     let kind = match ch.kind {
         ChannelType::GuildText => ChannelKind::Text,
         ChannelType::GuildAnnouncement => ChannelKind::Announcement,
         ChannelType::GuildCategory => ChannelKind::Category,
+        ChannelType::DM | ChannelType::GroupDM => ChannelKind::DirectMessage,
         _ => return None,
     };
     Some(ChannelSummary {
         id: ch.id.clone(),
-        guild_id: ch.guild_id.clone(),
+        guild_id: ch
+            .guild_id
+            .clone()
+            .or_else(|| is_direct_message.then(|| DIRECT_MESSAGES_GUILD_ID.to_string())),
         parent_id: ch.parent_id.clone(),
-        name: ch.name.clone().unwrap_or_else(|| "unnamed".into()),
+        name: channel_name(ch),
         kind,
         position: ch.position.unwrap_or_default(),
+        muted: false,
         unread: false,
         unread_count: 0,
         last_message_id: ch.last_message_id.clone(),
     })
 }
 
+pub fn channels_to_summaries(channels: &[diself::Channel]) -> Vec<ChannelSummary> {
+    let mut summaries: Vec<_> = channels.iter().filter_map(channel_to_summary).collect();
+    sort_channels_for_sidebar(&mut summaries);
+    summaries
+}
+
+pub fn apply_read_state_from_cache(channels: &mut [ChannelSummary], cache: &diself::Cache) {
+    for channel in channels {
+        let Some(read_state) = cache.read_state(&channel.id) else {
+            continue;
+        };
+
+        let last_acked = read_state
+            .last_acked_id
+            .as_deref()
+            .and_then(|id| id.parse::<u64>().ok())
+            .unwrap_or_default();
+        let last_message = channel
+            .last_message_id
+            .as_deref()
+            .or(read_state.last_message_id.as_deref())
+            .and_then(|id| id.parse::<u64>().ok())
+            .unwrap_or_default();
+
+        if last_message > last_acked {
+            channel.unread = true;
+            channel.unread_count = read_state
+                .mention_count
+                .or(read_state.badge_count)
+                .and_then(|count| u32::try_from(count).ok())
+                .unwrap_or_default();
+        }
+
+        if channel.last_message_id.is_none() {
+            channel
+                .last_message_id
+                .clone_from(&read_state.last_message_id);
+        }
+    }
+}
+
+fn parse_user_guild_mute_settings(
+    data: &serde_json::Value,
+) -> std::collections::HashMap<String, GuildMuteSettings> {
+    user_guild_settings_entries(data)
+        .into_iter()
+        .map(parse_user_guild_mute_setting)
+        .map(|settings| {
+            let guild_id = settings.guild_id.clone();
+            (guild_id, settings)
+        })
+        .collect()
+}
+
+fn parse_user_guild_mute_setting(data: &serde_json::Value) -> GuildMuteSettings {
+    let mut settings = GuildMuteSettings {
+        guild_id: normalize_user_guild_settings_id(data),
+        muted: data
+            .get("muted")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        channel_overrides: std::collections::HashMap::new(),
+    };
+
+    let Some(overrides) = data.get("channel_overrides") else {
+        return settings;
+    };
+
+    match overrides {
+        serde_json::Value::Array(entries) => {
+            for override_entry in entries {
+                let Some(channel_id) = override_entry
+                    .get("channel_id")
+                    .and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                settings.channel_overrides.insert(
+                    channel_id.to_string(),
+                    parse_channel_mute_override(override_entry),
+                );
+            }
+        }
+        serde_json::Value::Object(entries) => {
+            for (channel_id, override_entry) in entries {
+                settings.channel_overrides.insert(
+                    channel_id.clone(),
+                    parse_channel_mute_override(override_entry),
+                );
+            }
+        }
+        _ => {}
+    }
+
+    settings
+}
+
+fn normalize_user_guild_settings_id(data: &serde_json::Value) -> String {
+    match data.get("guild_id").and_then(serde_json::Value::as_str) {
+        Some("@me") | None => DIRECT_MESSAGES_GUILD_ID.to_string(),
+        Some(guild_id) => guild_id.to_string(),
+    }
+}
+
+fn parse_channel_mute_override(
+    override_entry: &serde_json::Value,
+) -> crate::model::ChannelMuteOverride {
+    crate::model::ChannelMuteOverride {
+        muted: override_entry
+            .get("muted")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+fn user_guild_settings_entries(data: &serde_json::Value) -> Vec<&serde_json::Value> {
+    data.get("user_guild_settings")
+        .and_then(|settings| {
+            settings
+                .get("entries")
+                .and_then(serde_json::Value::as_array)
+                .or_else(|| settings.as_array())
+        })
+        .map_or_else(Vec::new, |entries| entries.iter().collect())
+}
+
 pub fn guild_to_summary(id: &str, name: &str, icon_hash: Option<&str>) -> GuildSummary {
     GuildSummary {
         id: id.into(),
         name: name.into(),
+        muted: false,
         unread: false,
         unread_count: 0,
         avatar_url: guild_icon_url(id, icon_hash),
@@ -399,6 +554,31 @@ fn user_avatar_url(user_id: &str, avatar_hash: Option<&str>) -> Option<String> {
     Some(format!(
         "https://cdn.discordapp.com/avatars/{user_id}/{hash}.png?size=64"
     ))
+}
+
+fn channel_name(channel: &diself::Channel) -> String {
+    if let Some(name) = channel.name.as_deref().filter(|name| !name.is_empty()) {
+        return name.to_string();
+    }
+
+    if let Some(recipients) = channel
+        .recipients
+        .as_ref()
+        .filter(|users| !users.is_empty())
+    {
+        return recipients
+            .iter()
+            .map(|user| {
+                user.global_name
+                    .as_deref()
+                    .unwrap_or(&user.username)
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
+
+    "unnamed".to_string()
 }
 
 /// Convert messages from diself (newest-first from REST) to chronological order.

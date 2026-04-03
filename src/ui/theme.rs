@@ -1,5 +1,7 @@
 use ratatui::style::{Color, Modifier, Style};
 
+pub const MUTE_GLYPH: &str = "⊘";
+
 // Pane border when focused
 pub fn focused_border() -> Style {
     Style::new().fg(Color::Cyan)
@@ -54,6 +56,10 @@ pub fn error() -> Style {
 // Dimmed / secondary text
 pub fn dim() -> Style {
     Style::new().fg(Color::DarkGray)
+}
+
+pub fn muted() -> Style {
+    dim()
 }
 
 pub fn mention() -> Style {

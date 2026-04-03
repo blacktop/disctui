@@ -41,7 +41,6 @@ pub fn get_token() -> Result<String> {
 
 /// Store a token in the system keyring for future use.
 #[cfg(feature = "experimental-discord")]
-#[expect(dead_code, reason = "used in future interactive token prompt")]
 pub fn store_token(token: &str) -> Result<()> {
     let entry = keyring::Entry::new("disctui", "discord_token")
         .map_err(|e| eyre!("failed to create keyring entry: {e}"))?;

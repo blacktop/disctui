@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{ConnectionState, FocusPane, InputMode};
+use crate::model::ChannelKind;
 use crate::ui::theme;
 
 pub fn render(
@@ -12,7 +13,7 @@ pub fn render(
     mode: InputMode,
     focus: FocusPane,
     connection: ConnectionState,
-    channel_name: Option<&str>,
+    selected_channel: Option<(&str, ChannelKind)>,
     error_msg: Option<&str>,
 ) {
     let mode_span = match mode {
@@ -36,9 +37,11 @@ pub fn render(
 
     let focus_span = Span::styled(format!(" {} ", focus.label()), theme::status_bar());
 
-    let channel_span = match channel_name {
-        Some(name) => Span::styled(format!(" # {name} "), theme::status_bar()),
-        None => Span::styled(" -- ", theme::status_bar()),
+    let channel_span = match selected_channel {
+        Some((name, kind)) => {
+            Span::styled(format!(" {} {name} ", kind.marker()), theme::status_bar())
+        }
+        _ => Span::styled(" -- ", theme::status_bar()),
     };
 
     let hints = Span::styled(" q:quit  ?:help  Tab:focus  i:insert ", theme::dim());
