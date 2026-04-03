@@ -1,5 +1,5 @@
 <p align="center">
-  <!--<a href="https://github.com/blacktop/disctui"><img alt="Logo" src="https://raw.githubusercontent.com/blacktop/disctui/refs/heads/main/docs/logo.png" height="400"/></a>-->
+  <a href="https://github.com/blacktop/disctui"><img alt="Logo" src="https://raw.githubusercontent.com/blacktop/disctui/refs/heads/main/docs/logo.webp" height="400"/></a>
   <h1 align="center">disctui</h1>
   <h4><p align="center">A fast, minimal Discord TUI with AI-powered conversation summaries</p></h4>
   <p align="center">
@@ -14,7 +14,7 @@
 </p>
 <br>
 
-![disctui demo](./docs/logo.png)
+![disctui demo](./docs/demo.png)
 
 `disctui` is a terminal-first Discord client for reading guilds, DMs, and message history with a clean multi-pane layout, mute-aware unread state, inline media, and optional AI summaries.
 
