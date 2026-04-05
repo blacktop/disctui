@@ -4,6 +4,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use textwrap::wrap;
+use unicode_width::UnicodeWidthStr;
 
 use crate::model::MessageRow;
 use crate::ui::media::{AvatarStore, AvatarTone, badge_from_name};
@@ -34,10 +35,15 @@ struct ImageMarker {
     filename: String,
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "message pane renderer takes viewport, loading, unread-divider, and avatar state"
+)]
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     messages: &[MessageRow],
+    unread_divider_message_id: Option<&str>,
     scroll_offset: u16,
     loading_bar: Option<&str>,
     focused: bool,
@@ -74,7 +80,7 @@ pub fn render(
         height: inner.height,
     };
 
-    let plan = build_message_layout(messages, text_area.width);
+    let plan = build_message_layout(messages, text_area.width, unread_divider_message_id);
     let total_lines = u16::try_from(plan.lines.len()).unwrap_or(u16::MAX);
     let viewport_height = text_area.height;
     let max_scroll = total_lines.saturating_sub(viewport_height);
@@ -89,7 +95,11 @@ pub fn render(
     max_scroll
 }
 
-fn build_message_layout(messages: &[MessageRow], text_width: u16) -> MessageLayoutPlan {
+fn build_message_layout(
+    messages: &[MessageRow],
+    text_width: u16,
+    unread_divider_message_id: Option<&str>,
+) -> MessageLayoutPlan {
     if messages.is_empty() {
         return MessageLayoutPlan {
             lines: vec![Line::from(Span::styled("No messages yet", theme::dim()))],
@@ -105,6 +115,10 @@ fn build_message_layout(messages: &[MessageRow], text_width: u16) -> MessageLayo
     let wrap_width = usize::from(text_width.saturating_sub(2).max(8));
 
     for (idx, msg) in messages.iter().enumerate() {
+        if unread_divider_message_id == Some(msg.id.as_str()) {
+            lines.push(new_messages_divider_line(text_width));
+        }
+
         let group_start = lines.len();
         if !msg.is_continuation {
             let line_index = u16::try_from(lines.len()).unwrap_or(u16::MAX);
@@ -179,6 +193,25 @@ fn build_message_layout(messages: &[MessageRow], text_width: u16) -> MessageLayo
         avatars,
         images,
     }
+}
+
+fn new_messages_divider_line(text_width: u16) -> Line<'static> {
+    let width = usize::from(text_width.max(12));
+    let label = " New Messages ";
+    let label_width = label.width();
+    if width <= label_width {
+        return Line::from(Span::styled(label, theme::new_messages_divider()));
+    }
+
+    let side_width = (width.saturating_sub(label_width)) / 2;
+    let left = "─".repeat(side_width);
+    let right = "─".repeat(width.saturating_sub(label_width).saturating_sub(side_width));
+
+    Line::from(vec![
+        Span::styled(left, theme::new_messages_divider()),
+        Span::styled(label, theme::new_messages_divider()),
+        Span::styled(right, theme::new_messages_divider()),
+    ])
 }
 
 fn wrap_content_line(line: &str, width: usize) -> Vec<String> {

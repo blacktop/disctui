@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -9,6 +9,7 @@ use crate::effect::Effect;
 use crate::model::{
     ChannelDigest, ChannelKind, ChannelSummary, DIRECT_MESSAGES_GUILD_ID,
     DIRECT_MESSAGES_GUILD_NAME, GuildMuteSettings, GuildSummary, LoadScope, MessageRow,
+    sort_channels_for_sidebar,
 };
 use crate::store::{self, Store};
 use crate::ui::media::AvatarStore;
@@ -88,6 +89,12 @@ pub struct DiscordTokenPromptState {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+enum UnreadDividerAnchor {
+    StartOfMessages,
+    AfterMessage(String),
+}
+
 #[expect(clippy::struct_excessive_bools, reason = "independent UI state flags")]
 pub struct App {
     pub input_mode: InputMode,
@@ -120,6 +127,10 @@ pub struct App {
     /// Index into self.messages marking the boundary between read and unread.
     /// Messages at index >= `read_watermark` are considered "unread".
     read_watermark: usize,
+    /// Pending anchor used to resolve the "new messages" divider after history loads.
+    unread_divider_anchor: Option<UnreadDividerAnchor>,
+    /// Message id before which the "new messages" divider should be rendered.
+    unread_divider_message_id: Option<String>,
     /// Channels per guild, populated from `GUILD_CREATE` events.
     guild_channels: HashMap<String, Vec<ChannelSummary>>,
     /// User mute preferences from Discord notification settings.
@@ -164,6 +175,8 @@ impl App {
             next_message_id: 1000,
             store: None,
             read_watermark: 0,
+            unread_divider_anchor: None,
+            unread_divider_message_id: None,
             guild_channels: HashMap::new(),
             guild_mute_settings: HashMap::new(),
             active_loads: BTreeSet::new(),
@@ -237,6 +250,7 @@ impl App {
             Action::JumpTop => self.jump_to_boundary(true),
             Action::JumpBottom => self.jump_to_boundary(false),
             Action::MarkAllRead => self.mark_all_read(),
+            Action::RefreshNow => return self.refresh_now(),
             Action::OpenSelected => return self.open_selected(),
             Action::EnterInsert | Action::StartQuickReplyFromSummary => {
                 self.input_mode = InputMode::Insert;
@@ -422,6 +436,10 @@ impl App {
     pub fn messages_pane_loading_bar(&self) -> Option<String> {
         self.messages_pane_loading()
             .then(|| ghostty_progress_bar(self.tick_count))
+    }
+
+    pub fn unread_divider_message_id(&self) -> Option<&str> {
+        self.unread_divider_message_id.as_deref()
     }
 
     pub fn discord_token_prompt(&self) -> Option<&DiscordTokenPromptState> {
@@ -618,8 +636,7 @@ impl App {
     }
 
     fn sort_visible_channels(&mut self) {
-        self.channels
-            .sort_by(|a, b| a.position.cmp(&b.position).then(a.name.cmp(&b.name)));
+        sort_channels_for_sidebar(&mut self.channels);
     }
 
     fn apply_guild_mute_settings_to_channels(
@@ -640,6 +657,178 @@ impl App {
                 .get(&channel.id)
                 .is_some_and(|override_settings| override_settings.muted);
         }
+    }
+
+    fn channel_is_read(store: Option<&Store>, channel: &ChannelSummary) -> bool {
+        let Some(store) = store else {
+            return false;
+        };
+        let Some(last_message_id) = channel.last_message_id.as_deref() else {
+            return false;
+        };
+        store.last_read_message(&channel.id).is_some_and(|read_id| {
+            match (read_id.parse::<u64>(), last_message_id.parse::<u64>()) {
+                (Ok(read_id), Ok(last_message_id)) => read_id >= last_message_id,
+                _ => false,
+            }
+        })
+    }
+
+    fn find_channel(&self, channel_id: &str) -> Option<&ChannelSummary> {
+        self.channels
+            .iter()
+            .find(|channel| channel.id == channel_id)
+            .or_else(|| {
+                self.guild_channels
+                    .values()
+                    .flat_map(|channels| channels.iter())
+                    .find(|channel| channel.id == channel_id)
+            })
+    }
+
+    fn log_channel_debug_state(
+        &self,
+        channel_id: &str,
+        channel: Option<&ChannelSummary>,
+        reason: &str,
+        loaded_messages: Option<usize>,
+    ) {
+        let stored_read = self
+            .store
+            .as_deref()
+            .and_then(|store| store.last_read_message(channel_id));
+
+        if let Some(channel) = channel {
+            tracing::debug!(
+                reason,
+                channel_id = %channel.id,
+                channel_name = %channel.name,
+                kind = ?channel.kind,
+                guild_id = ?channel.guild_id,
+                unread = channel.unread,
+                unread_count = channel.unread_count,
+                last_message_id = ?channel.last_message_id,
+                stored_read = ?stored_read,
+                selected = self.selected_channel_id.as_deref() == Some(channel_id),
+                loaded_messages = ?loaded_messages,
+                "channel debug state"
+            );
+        } else {
+            tracing::debug!(
+                reason,
+                channel_id,
+                stored_read = ?stored_read,
+                selected = self.selected_channel_id.as_deref() == Some(channel_id),
+                loaded_messages = ?loaded_messages,
+                "channel debug state missing from caches"
+            );
+        }
+    }
+
+    fn snowflake_eq(left: &str, right: &str) -> bool {
+        match (left.parse::<u64>(), right.parse::<u64>()) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => left == right,
+        }
+    }
+
+    fn message_id_advanced(previous: Option<&str>, current: Option<&str>) -> bool {
+        match (
+            previous.and_then(|id| id.parse::<u64>().ok()),
+            current.and_then(|id| id.parse::<u64>().ok()),
+        ) {
+            (Some(previous), Some(current)) => current > previous,
+            (None, Some(_)) => true,
+            _ => false,
+        }
+    }
+
+    fn resolve_unread_divider_message_id(
+        messages: &[MessageRow],
+        anchor: Option<&UnreadDividerAnchor>,
+    ) -> Option<String> {
+        let anchor = anchor?;
+        match anchor {
+            UnreadDividerAnchor::StartOfMessages => {
+                messages.first().map(|message| message.id.clone())
+            }
+            UnreadDividerAnchor::AfterMessage(read_id) => messages
+                .iter()
+                .position(|message| Self::snowflake_eq(message.id.as_str(), read_id.as_str()))
+                .and_then(|idx| messages.get(idx.saturating_add(1)))
+                // If the read anchor is older than the loaded history window, every visible
+                // message is still newer than the last acknowledged message.
+                .or_else(|| messages.first())
+                .map(|message| message.id.clone()),
+        }
+    }
+
+    fn merge_refreshed_channels(
+        &self,
+        fresh_channels: &mut Vec<ChannelSummary>,
+        previous_channels: Option<&[ChannelSummary]>,
+    ) {
+        let store = self.store.as_deref();
+
+        if let Some(previous_channels) = previous_channels {
+            let previous_by_id: HashMap<&str, &ChannelSummary> = previous_channels
+                .iter()
+                .map(|channel| (channel.id.as_str(), channel))
+                .collect();
+            for fresh in fresh_channels.iter_mut() {
+                let Some(previous) = previous_by_id.get(fresh.id.as_str()).copied() else {
+                    continue;
+                };
+
+                if fresh.last_message_id.is_none() {
+                    fresh.last_message_id.clone_from(&previous.last_message_id);
+                }
+
+                if self.selected_channel_id.as_deref() == Some(fresh.id.as_str()) {
+                    continue;
+                }
+
+                if Self::channel_is_read(store, fresh) {
+                    fresh.unread = false;
+                    fresh.unread_count = 0;
+                    continue;
+                }
+
+                let message_advanced = Self::message_id_advanced(
+                    previous.last_message_id.as_deref(),
+                    fresh.last_message_id.as_deref(),
+                );
+
+                if fresh.unread || previous.unread || message_advanced {
+                    fresh.unread = true;
+                    if fresh.unread_count == 0 {
+                        fresh.unread_count = if message_advanced {
+                            if previous.unread {
+                                previous.unread_count.max(1).saturating_add(1)
+                            } else {
+                                1
+                            }
+                        } else {
+                            previous.unread_count.max(1)
+                        };
+                    }
+                }
+            }
+
+            let fresh_ids: HashSet<String> = fresh_channels
+                .iter()
+                .map(|channel| channel.id.clone())
+                .collect();
+            for previous in previous_channels {
+                let keep_missing = previous.unread
+                    || self.selected_channel_id.as_deref() == Some(previous.id.as_str());
+                if keep_missing && !fresh_ids.contains(previous.id.as_str()) {
+                    fresh_channels.push(previous.clone());
+                }
+            }
+        }
+
+        sort_channels_for_sidebar(fresh_channels);
     }
 
     fn apply_guild_mute_settings(
@@ -811,6 +1000,8 @@ impl App {
             store.mark_read(ch_id, &last_msg.id);
         }
         self.read_watermark = self.messages.len();
+        self.unread_divider_anchor = None;
+        self.unread_divider_message_id = None;
     }
 
     fn tick(&mut self) -> Vec<Effect> {
@@ -823,17 +1014,66 @@ impl App {
         }
 
         self.tick_count += 1;
-        // Only auto-refresh for mock transport. Live transport gets real-time
-        // updates via the gateway — periodic REST refreshes cause race conditions
-        // (replacing gateway-delivered messages with potentially stale data).
+        // Live Discord already receives gateway updates; periodic REST refreshes can still race
+        // with fresher gateway-delivered state, so keep auto-refresh scoped to the mock transport.
         if self.connection_state == ConnectionState::MockTransport
             && self.tick_count.is_multiple_of(40)
-            && let Some(channel_id) = self.selected_channel_id.clone()
         {
-            return vec![Effect::LoadHistory { channel_id }];
+            return self.refresh_effects();
         }
 
         Vec::new()
+    }
+
+    fn refresh_now(&mut self) -> Vec<Effect> {
+        let effects = self.refresh_effects();
+        if effects.is_empty() {
+            let message = match self.connection_state {
+                ConnectionState::Connecting | ConnectionState::Reconnecting => "Still connecting",
+                ConnectionState::Disconnected => "Connect first to refresh",
+                ConnectionState::Connected | ConnectionState::MockTransport => {
+                    if self.selected_guild_id.is_none() && self.selected_channel_id.is_none() {
+                        "Select a guild or channel to refresh"
+                    } else {
+                        "Refresh already in progress"
+                    }
+                }
+            };
+            self.set_error(message.into());
+        }
+        effects
+    }
+
+    fn refresh_effects(&self) -> Vec<Effect> {
+        if matches!(
+            self.connection_state,
+            ConnectionState::Connecting | ConnectionState::Disconnected
+        ) {
+            return Vec::new();
+        }
+
+        let mut effects = Vec::new();
+
+        if let Some(guild_id) = self.selected_guild_id.clone() {
+            let scope = LoadScope::ChannelList(guild_id.clone());
+            if !self.active_loads.contains(&scope) {
+                effects.push(Effect::LoadChannels { guild_id });
+            }
+        }
+
+        if let Some(channel_id) = self.selected_channel_id.clone() {
+            let scope = LoadScope::History(channel_id.clone());
+            if !self.active_loads.contains(&scope) {
+                effects.push(Effect::LoadHistory { channel_id });
+            }
+        } else if self.guilds.is_empty()
+            && !self.active_loads.contains(&LoadScope::GuildBootstrap)
+            && self.connection_state == ConnectionState::MockTransport
+        {
+            effects.push(Effect::LoadGuilds);
+        }
+
+        effects
     }
 
     fn handle_request_summary(&mut self) -> Vec<Effect> {
@@ -1048,12 +1288,40 @@ impl App {
         guild_id: Option<&str>,
         mut channels: Vec<ChannelSummary>,
     ) -> Vec<Effect> {
+        let previous_channels = guild_id.and_then(|gid| self.guild_channels.get(gid).cloned());
+        let previous_selected_channel_id = self.selected_channel_id.clone();
+
         // Persist into the per-guild cache so restore_session and unread tracking work
         if let Some(gid) = guild_id {
             self.prepare_loaded_channels(gid, &mut channels);
+            self.merge_refreshed_channels(&mut channels, previous_channels.as_deref());
             self.guild_channels
                 .insert(gid.to_string(), channels.clone());
             self.sync_guild_unread_from_channels(gid);
+        }
+
+        if guild_id == Some(DIRECT_MESSAGES_GUILD_ID) {
+            for channel in channels
+                .iter()
+                .filter(|channel| channel.unread || channel.last_message_id.is_some())
+            {
+                let stored_read = self
+                    .store
+                    .as_deref()
+                    .and_then(|store| store.last_read_message(&channel.id));
+                tracing::debug!(
+                    reason = "dm_channels_loaded",
+                    channel_id = %channel.id,
+                    channel_name = %channel.name,
+                    kind = ?channel.kind,
+                    guild_id = ?channel.guild_id,
+                    unread = channel.unread,
+                    unread_count = channel.unread_count,
+                    last_message_id = ?channel.last_message_id,
+                    stored_read = ?stored_read,
+                    "loaded DM channel summary"
+                );
+            }
         }
 
         if guild_id.is_some() && guild_id != self.selected_guild_id.as_deref() {
@@ -1062,7 +1330,14 @@ impl App {
 
         self.channels = channels;
         self.channel_state = ListState::default();
-        if let Some(idx) = self.first_selectable_channel_index() {
+        if let Some(selected_channel_id) = previous_selected_channel_id.as_deref()
+            && let Some(idx) = self
+                .channels
+                .iter()
+                .position(|channel| channel.id == selected_channel_id)
+        {
+            self.channel_state.select(Some(idx));
+        } else if let Some(idx) = self.first_selectable_channel_index() {
             self.channel_state.select(Some(idx));
         }
 
@@ -1079,6 +1354,25 @@ impl App {
         messages: Vec<MessageRow>,
     ) -> Vec<Effect> {
         if self.selected_channel_id.as_deref() == Some(channel_id) {
+            let current_channel = self.find_channel(channel_id);
+            let suspicious_empty_history = current_channel.is_some_and(|channel| {
+                channel.last_message_id.is_some() || channel.unread || channel.unread_count > 0
+            }) || self.unread_divider_anchor.is_some()
+                || self.unread_divider_message_id.is_some();
+            self.log_channel_debug_state(
+                channel_id,
+                current_channel,
+                "history_loaded_before_apply",
+                Some(messages.len()),
+            );
+            if messages.is_empty() && suspicious_empty_history {
+                tracing::warn!(
+                    channel_id,
+                    unread_divider_anchor = ?self.unread_divider_anchor,
+                    unread_divider_message_id = ?self.unread_divider_message_id,
+                    "selected channel history loaded empty; read state will not advance"
+                );
+            }
             let effects = self.request_avatar_effects(
                 messages
                     .iter()
@@ -1092,7 +1386,27 @@ impl App {
                     .map(|attachment| attachment.url.as_str()),
             );
             let had_messages = !self.messages.is_empty();
-            self.read_watermark = messages.len();
+            let preserved_divider = self
+                .unread_divider_message_id
+                .as_ref()
+                .filter(|message_id| messages.iter().any(|message| &message.id == *message_id))
+                .cloned();
+            let resolved_divider = preserved_divider.or_else(|| {
+                Self::resolve_unread_divider_message_id(
+                    &messages,
+                    self.unread_divider_anchor.as_ref(),
+                )
+            });
+            self.unread_divider_message_id.clone_from(&resolved_divider);
+            self.unread_divider_anchor = None;
+            self.read_watermark = resolved_divider
+                .as_ref()
+                .and_then(|message_id| {
+                    messages
+                        .iter()
+                        .position(|message| &message.id == message_id)
+                })
+                .unwrap_or(messages.len());
 
             // Persist the last message ID as our read position (only if changed)
             if let Some(last) = messages.last()
@@ -1106,6 +1420,12 @@ impl App {
             if !had_messages {
                 self.at_bottom = true;
             }
+            self.log_channel_debug_state(
+                channel_id,
+                self.find_channel(channel_id),
+                "history_loaded_after_apply",
+                Some(self.messages.len()),
+            );
             let mut effects = effects;
             effects.append(&mut attachment_effects);
             return effects;
@@ -1150,32 +1470,33 @@ impl App {
             matched_channel = true;
         }
 
-        if !matched_channel && let Some(mut hinted_channel) = channel_hint {
-            if let Some(guild_id) = hinted_channel.guild_id.clone() {
-                Self::apply_guild_mute_settings_to_channels(
-                    &guild_id,
-                    std::slice::from_mut(&mut hinted_channel),
-                    &self.guild_mute_settings,
-                );
-                mark_channel_unread(&mut hinted_channel, &msg_id);
-                affected_guild_id = Some(guild_id.clone());
-                let cached_channels = self.guild_channels.entry(guild_id.clone()).or_default();
-                if !cached_channels
+        if !matched_channel
+            && let Some(mut hinted_channel) = channel_hint
+            && let Some(guild_id) = hinted_channel.guild_id.clone()
+        {
+            Self::apply_guild_mute_settings_to_channels(
+                &guild_id,
+                std::slice::from_mut(&mut hinted_channel),
+                &self.guild_mute_settings,
+            );
+            mark_channel_unread(&mut hinted_channel, &msg_id);
+            affected_guild_id = Some(guild_id.clone());
+            let cached_channels = self.guild_channels.entry(guild_id.clone()).or_default();
+            if !cached_channels
+                .iter()
+                .any(|channel| channel.id == hinted_channel.id)
+            {
+                cached_channels.push(hinted_channel.clone());
+            }
+
+            if self.selected_guild_id.as_deref() == Some(guild_id.as_str())
+                && !self
+                    .channels
                     .iter()
                     .any(|channel| channel.id == hinted_channel.id)
-                {
-                    cached_channels.push(hinted_channel.clone());
-                }
-
-                if self.selected_guild_id.as_deref() == Some(guild_id.as_str())
-                    && !self
-                        .channels
-                        .iter()
-                        .any(|channel| channel.id == hinted_channel.id)
-                {
-                    self.channels.push(hinted_channel);
-                    self.sort_visible_channels();
-                }
+            {
+                self.channels.push(hinted_channel);
+                self.sort_visible_channels();
             }
         }
 
@@ -1331,6 +1652,9 @@ impl App {
         self.selected_channel_id = None;
         self.messages.clear();
         self.message_scroll_offset = 0;
+        self.read_watermark = 0;
+        self.unread_divider_anchor = None;
+        self.unread_divider_message_id = None;
         self.message_pane_view = MessagePaneView::Messages;
         self.summary_state = SummaryPaneState::default();
         self.focus = FocusPane::Channels;
@@ -1362,6 +1686,22 @@ impl App {
             return Vec::new();
         }
         let channel_id = channel.id.clone();
+        let had_unread = channel.unread;
+        let stored_read = self
+            .store
+            .as_deref()
+            .and_then(|store| store.last_read_message(&channel_id));
+        tracing::debug!(
+            channel_id = %channel_id,
+            channel_name = %channel.name,
+            kind = ?channel.kind,
+            guild_id = ?channel.guild_id,
+            had_unread,
+            unread_count = channel.unread_count,
+            last_message_id = ?channel.last_message_id,
+            stored_read = ?stored_read,
+            "opening channel"
+        );
 
         // Clear unread in both the visible list and the per-guild cache
         if let Some(ch) = self.channels.iter_mut().find(|c| c.id == channel_id) {
@@ -1382,6 +1722,17 @@ impl App {
         self.selected_channel_id = Some(channel_id.clone());
         self.messages.clear();
         self.message_scroll_offset = 0;
+        self.read_watermark = 0;
+        self.unread_divider_message_id = None;
+        self.unread_divider_anchor = if had_unread {
+            self.store
+                .as_deref()
+                .and_then(|store| store.last_read_message(&channel_id))
+                .map(UnreadDividerAnchor::AfterMessage)
+                .or(Some(UnreadDividerAnchor::StartOfMessages))
+        } else {
+            None
+        };
         self.message_pane_view = MessagePaneView::Messages;
         self.summary_state = SummaryPaneState::default();
         self.focus = FocusPane::Messages;
@@ -1837,6 +2188,43 @@ mod tests {
     }
 
     #[test]
+    fn opening_unread_channel_sets_divider_at_first_unread_message() {
+        let store = std::rc::Rc::new(Store::open_in_memory());
+        store.mark_read("c1", "m3");
+
+        let mut app = app_with_guilds();
+        app.store = Some(store);
+
+        app.focus = FocusPane::Guilds;
+        let effects = app.update(Action::OpenSelected);
+        if let Some(Effect::LoadChannels { guild_id }) = effects.first() {
+            app.update(Action::ChannelsLoaded {
+                guild_id: Some(guild_id.clone()),
+                channels: mock::channels(guild_id),
+            });
+        }
+
+        let unread_idx = app
+            .channels
+            .iter()
+            .position(|channel| channel.id == "c1")
+            .unwrap();
+        app.channel_state.select(Some(unread_idx));
+        app.focus = FocusPane::Channels;
+        let effects = app.update(Action::OpenSelected);
+        if let Some(Effect::LoadHistory { channel_id }) = effects.first() {
+            app.update(Action::HistoryLoaded {
+                channel_id: channel_id.clone(),
+                messages: mock::messages(channel_id),
+                has_more: false,
+            });
+        }
+
+        assert_eq!(app.unread_divider_message_id(), Some("m4"));
+        assert_eq!(app.read_watermark, 3);
+    }
+
+    #[test]
     fn load_priority_prefers_history_over_channel_list() {
         let mut app = App::new();
         app.selected_guild_id = Some("g1".into());
@@ -1976,6 +2364,35 @@ mod tests {
         assert!(!app.messages.is_empty());
         assert_eq!(app.focus, FocusPane::Messages);
         assert!(app.selected_channel_id.is_some());
+    }
+
+    #[test]
+    fn manual_refresh_emits_channel_and_history_effects() {
+        let mut app = app_in_channel();
+
+        let effects = app.update(Action::RefreshNow);
+
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::LoadChannels { .. }))
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::LoadHistory { .. }))
+        );
+    }
+
+    #[test]
+    fn tick_does_not_auto_refresh_live_transport() {
+        let mut app = app_in_channel();
+        app.connection_state = ConnectionState::Connected;
+        app.tick_count = 39;
+
+        let effects = app.update(Action::Tick);
+
+        assert!(effects.is_empty());
     }
 
     #[test]
@@ -2421,6 +2838,72 @@ mod tests {
             .unwrap();
         assert!(guild.unread);
         assert!(guild.unread_count >= 1);
+    }
+
+    #[test]
+    fn refresh_detects_new_background_messages_even_for_muted_guilds() {
+        let mut app = app_in_channel();
+        let guild_id = app.selected_guild_id.clone().unwrap();
+        let selected_channel_id = app.selected_channel_id.clone().unwrap();
+
+        if let Some(cached_channels) = app.guild_channels.get_mut(&guild_id) {
+            for channel in cached_channels {
+                channel.unread = false;
+                channel.unread_count = 0;
+                channel.last_message_id = Some("100".into());
+            }
+        }
+        for channel in &mut app.channels {
+            channel.unread = false;
+            channel.unread_count = 0;
+            channel.last_message_id = Some("100".into());
+        }
+        if let Some(guild) = app.guilds.iter_mut().find(|guild| guild.id == guild_id) {
+            guild.unread = false;
+            guild.unread_count = 0;
+        }
+
+        app.update(Action::GuildMuteSettingsUpdated(GuildMuteSettings {
+            guild_id: guild_id.clone(),
+            muted: true,
+            channel_overrides: HashMap::new(),
+        }));
+
+        let mut refreshed = mock::channels(&guild_id);
+        for channel in &mut refreshed {
+            channel.unread = false;
+            channel.unread_count = 0;
+            channel.last_message_id = Some("100".into());
+        }
+        let background_id = refreshed
+            .iter_mut()
+            .find(|channel| channel.kind.is_selectable() && channel.id != selected_channel_id)
+            .map(|channel| {
+                channel.last_message_id = Some("200".into());
+                channel.id.clone()
+            })
+            .unwrap();
+
+        app.update(Action::ChannelsLoaded {
+            guild_id: Some(guild_id.clone()),
+            channels: refreshed,
+        });
+
+        let visible = app
+            .channels
+            .iter()
+            .find(|channel| channel.id == background_id)
+            .unwrap();
+        assert!(visible.unread);
+        assert_eq!(visible.unread_count, 1);
+
+        let guild = app
+            .guilds
+            .iter()
+            .find(|guild| guild.id == guild_id)
+            .unwrap();
+        assert!(!guild.unread);
+        assert_eq!(guild.unread_count, 0);
     }
 
     #[test]

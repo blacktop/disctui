@@ -35,6 +35,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let guild_pane_loading_bar = app.guild_pane_loading_bar();
     let channels_pane_loading_bar = app.channels_pane_loading_bar();
     let messages_pane_loading_bar = app.messages_pane_loading_bar();
+    let unread_divider_message_id = app.unread_divider_message_id().map(str::to_string);
 
     guilds::render(
         frame,
@@ -64,6 +65,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 frame,
                 content_area,
                 &app.messages,
+                unread_divider_message_id.as_deref(),
                 if app.at_bottom {
                     u16::MAX
                 } else {

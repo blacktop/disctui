@@ -54,6 +54,7 @@ fn map_normal_mode(key: &KeyEvent, focus: FocusPane) -> Option<Action> {
         KeyCode::BackTab => Some(Action::FocusPrev),
         KeyCode::Enter => Some(Action::OpenSelected),
         KeyCode::Char('i') => Some(Action::EnterInsert),
+        KeyCode::Char('r') => Some(Action::RefreshNow),
         KeyCode::Char('?') => Some(Action::ToggleHelp),
         KeyCode::Char('R') => Some(Action::MarkAllRead),
         KeyCode::Char('s') => Some(Action::RequestSummary),
@@ -111,5 +112,14 @@ mod tests {
     fn input_focus_uses_message_column_for_horizontal_navigation() {
         assert_eq!(focus_left(FocusPane::Input), FocusPane::Channels);
         assert_eq!(focus_right(FocusPane::Input), FocusPane::Guilds);
+    }
+
+    #[test]
+    fn r_key_triggers_manual_refresh() {
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        assert!(matches!(
+            map_terminal_event(&event, InputMode::Normal, FocusPane::Messages),
+            Some(Action::RefreshNow)
+        ));
     }
 }

@@ -4,13 +4,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use diself::prelude::*;
+use serde::Deserialize;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
 use crate::action::Action;
 use crate::model::{
     AttachmentSummary, ChannelKind, ChannelSummary, DIRECT_MESSAGES_GUILD_ID, GuildMuteSettings,
-    GuildSummary, MessageRow,
+    GuildSummary, MessageRow, sort_channels_for_sidebar,
 };
 
 pub struct DiscordBridge {
@@ -240,31 +241,21 @@ pub fn connect(
 
 pub fn message_to_row(msg: &Message, is_continuation: bool) -> MessageRow {
     let timestamp = parse_discord_timestamp(&msg.timestamp);
-    let author = msg
-        .author
-        .global_name
-        .as_deref()
-        .unwrap_or(&msg.author.username)
-        .to_string();
-
-    // Resolve <@userid> mentions to display names
-    let mut content = msg.content.clone();
-    for mentioned_user in &msg.mentions {
-        let mention_tag = format!("<@{}>", mentioned_user.id);
-        let display_name = mentioned_user
-            .global_name
-            .as_deref()
-            .unwrap_or(&mentioned_user.username);
-        content = content.replace(&mention_tag, &format!("@{display_name}"));
-        // Also handle the nickname mention format <@!userid>
-        let nick_tag = format!("<@!{}>", mentioned_user.id);
-        content = content.replace(&nick_tag, &format!("@{display_name}"));
-    }
-
-    // Prefix reply indicator if this is a reply
-    if msg.message_reference.is_some() {
-        content = format!("↩ {content}");
-    }
+    let author =
+        preferred_user_name(&msg.author.username, msg.author.global_name.as_deref()).to_string();
+    let content = render_message_content(
+        &msg.content,
+        msg.mentions.iter().map(|mentioned_user| {
+            (
+                mentioned_user.id.as_str(),
+                preferred_user_name(
+                    &mentioned_user.username,
+                    mentioned_user.global_name.as_deref(),
+                ),
+            )
+        }),
+        msg.message_reference.is_some(),
+    );
 
     MessageRow {
         id: msg.id.clone(),
@@ -275,22 +266,76 @@ pub fn message_to_row(msg: &Message, is_continuation: bool) -> MessageRow {
         attachments: msg
             .attachments
             .iter()
-            .map(|attachment| AttachmentSummary {
-                id: attachment.id.clone(),
-                filename: attachment.filename.clone(),
-                url: attachment.proxy_url.clone(),
-                content_type: attachment.content_type.clone(),
-                width: attachment.width,
-                height: attachment.height,
-                is_image: attachment
-                    .content_type
-                    .as_deref()
-                    .is_some_and(|content_type| content_type.starts_with("image/")),
+            .map(|attachment| {
+                attachment_summary(AttachmentSummaryInput {
+                    id: attachment.id.clone(),
+                    filename: attachment.filename.clone(),
+                    url: attachment.proxy_url.clone(),
+                    content_type: attachment.content_type.clone(),
+                    width: attachment.width,
+                    height: attachment.height,
+                })
             })
             .collect(),
         timestamp,
         edited: msg.edited_timestamp.is_some(),
         is_continuation,
+    }
+}
+
+fn preferred_user_name<'a>(username: &'a str, global_name: Option<&'a str>) -> &'a str {
+    global_name.unwrap_or(username)
+}
+
+fn render_message_content<'a, I>(content: &str, mentions: I, is_reply: bool) -> String
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let mut rendered = content.to_string();
+    for (user_id, display_name) in mentions {
+        let mention_tag = format!("<@{user_id}>");
+        rendered = rendered.replace(&mention_tag, &format!("@{display_name}"));
+        let nick_tag = format!("<@!{user_id}>");
+        rendered = rendered.replace(&nick_tag, &format!("@{display_name}"));
+    }
+
+    if is_reply {
+        return format!("↩ {rendered}");
+    }
+
+    rendered
+}
+
+struct AttachmentSummaryInput {
+    id: String,
+    filename: String,
+    url: String,
+    content_type: Option<String>,
+    width: Option<u64>,
+    height: Option<u64>,
+}
+
+fn attachment_summary(input: AttachmentSummaryInput) -> AttachmentSummary {
+    let AttachmentSummaryInput {
+        id,
+        filename,
+        url,
+        content_type,
+        width,
+        height,
+    } = input;
+    let is_image = content_type
+        .as_deref()
+        .is_some_and(|content_type| content_type.starts_with("image/"));
+
+    AttachmentSummary {
+        id,
+        filename,
+        url,
+        content_type,
+        width,
+        height,
+        is_image,
     }
 }
 
@@ -446,12 +491,30 @@ pub fn apply_read_state_from_cache(channels: &mut [ChannelSummary], cache: &dise
                 .or(read_state.badge_count)
                 .and_then(|count| u32::try_from(count).ok())
                 .unwrap_or_default();
+            tracing::debug!(
+                channel_id = %channel.id,
+                channel_name = %channel.name,
+                kind = ?channel.kind,
+                guild_id = ?channel.guild_id,
+                last_acked,
+                last_message,
+                mention_count = ?read_state.mention_count,
+                badge_count = ?read_state.badge_count,
+                unread_count = channel.unread_count,
+                "cache read state marked channel unread"
+            );
         }
 
         if channel.last_message_id.is_none() {
             channel
                 .last_message_id
                 .clone_from(&read_state.last_message_id);
+            tracing::debug!(
+                channel_id = %channel.id,
+                channel_name = %channel.name,
+                read_state_last_message_id = ?read_state.last_message_id,
+                "filled channel last_message_id from cache read state"
+            );
         }
     }
 }
@@ -592,57 +655,115 @@ fn channel_name(channel: &diself::Channel) -> String {
 }
 
 /// Convert messages from diself (newest-first from REST) to chronological order.
-pub fn messages_to_rows(messages: &[Message]) -> Vec<MessageRow> {
-    let mut rows: Vec<MessageRow> = Vec::with_capacity(messages.len());
-    for msg in messages.iter().rev() {
-        let author_name = msg
-            .author
-            .global_name
-            .as_deref()
-            .unwrap_or(&msg.author.username);
-        let is_continuation = rows.last().is_some_and(|prev| prev.author == author_name);
-        rows.push(message_to_row(msg, is_continuation));
-    }
-    rows
+#[derive(Debug, Deserialize)]
+struct HistoryMessagePayload {
+    id: String,
+    #[serde(default)]
+    channel_id: String,
+    author: HistoryUserPayload,
+    #[serde(default)]
+    content: String,
+    timestamp: String,
+    #[serde(default)]
+    edited_timestamp: Option<String>,
+    #[serde(default)]
+    mentions: Vec<HistoryUserPayload>,
+    #[serde(default)]
+    attachments: Vec<HistoryAttachmentPayload>,
+    #[serde(default)]
+    message_reference: Option<serde_json::Value>,
 }
 
-fn sort_channels_for_sidebar(channels: &mut Vec<ChannelSummary>) {
-    channels.sort_by(|a, b| a.position.cmp(&b.position).then(a.name.cmp(&b.name)));
+#[derive(Debug, Deserialize)]
+struct HistoryUserPayload {
+    id: String,
+    username: String,
+    #[serde(default)]
+    global_name: Option<String>,
+    #[serde(default)]
+    avatar: Option<String>,
+}
 
-    let mut uncategorized = Vec::new();
-    let mut categories = Vec::new();
-    let mut children: std::collections::HashMap<String, Vec<ChannelSummary>> =
-        std::collections::HashMap::new();
+#[derive(Debug, Deserialize)]
+struct HistoryAttachmentPayload {
+    id: String,
+    filename: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    proxy_url: String,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    width: Option<u64>,
+    #[serde(default)]
+    height: Option<u64>,
+}
 
-    for channel in channels.drain(..) {
-        match channel.kind {
-            ChannelKind::Category => categories.push(channel),
-            _ if channel.parent_id.is_none() => uncategorized.push(channel),
-            _ => {
-                if let Some(parent_id) = channel.parent_id.clone() {
-                    children.entry(parent_id).or_default().push(channel);
-                }
-            }
-        }
+pub fn history_rows_from_value(
+    requested_channel_id: &str,
+    value: serde_json::Value,
+) -> serde_json::Result<Vec<MessageRow>> {
+    let messages: Vec<HistoryMessagePayload> = serde_json::from_value(value)?;
+    let mut rows: Vec<MessageRow> = Vec::with_capacity(messages.len());
+
+    for msg in messages.into_iter().rev() {
+        let author = preferred_user_name(&msg.author.username, msg.author.global_name.as_deref())
+            .to_string();
+        let is_continuation = rows.last().is_some_and(|prev| prev.author == author);
+
+        let content = render_message_content(
+            &msg.content,
+            msg.mentions.iter().map(|mentioned_user| {
+                (
+                    mentioned_user.id.as_str(),
+                    preferred_user_name(
+                        &mentioned_user.username,
+                        mentioned_user.global_name.as_deref(),
+                    ),
+                )
+            }),
+            msg.message_reference.is_some(),
+        );
+
+        let attachments = msg
+            .attachments
+            .into_iter()
+            .map(|attachment| {
+                let url = if attachment.proxy_url.is_empty() {
+                    attachment.url
+                } else {
+                    attachment.proxy_url
+                };
+                attachment_summary(AttachmentSummaryInput {
+                    id: attachment.id,
+                    filename: attachment.filename,
+                    url,
+                    content_type: attachment.content_type,
+                    width: attachment.width,
+                    height: attachment.height,
+                })
+            })
+            .collect();
+
+        rows.push(MessageRow {
+            id: msg.id,
+            channel_id: if msg.channel_id.is_empty() {
+                requested_channel_id.to_string()
+            } else {
+                msg.channel_id
+            },
+            author,
+            author_avatar_url: user_avatar_url(&msg.author.id, msg.author.avatar.as_deref()),
+            content,
+            attachments,
+            timestamp: parse_discord_timestamp(&msg.timestamp),
+            edited: msg.edited_timestamp.is_some(),
+            is_continuation,
+        });
     }
 
-    categories.sort_by(|a, b| a.position.cmp(&b.position).then(a.name.cmp(&b.name)));
-    uncategorized.sort_by(|a, b| a.position.cmp(&b.position).then(a.name.cmp(&b.name)));
-    for child_group in children.values_mut() {
-        child_group.sort_by(|a, b| a.position.cmp(&b.position).then(a.name.cmp(&b.name)));
-    }
-
-    channels.extend(uncategorized);
-    for category in categories {
-        let category_id = category.id.clone();
-        channels.push(category);
-        if let Some(group_children) = children.remove(&category_id) {
-            channels.extend(group_children);
-        }
-    }
-    for orphan_children in children.into_values() {
-        channels.extend(orphan_children);
-    }
+    Ok(rows)
 }
 
 fn parse_discord_timestamp(ts: &str) -> String {
@@ -664,6 +785,53 @@ fn parse_discord_timestamp(ts: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_rows_ignore_sticker_items_without_description() {
+        let payload = serde_json::json!([
+            {
+                "id": "m1",
+                "channel_id": "dm1",
+                "author": {
+                    "id": "u1",
+                    "username": "alice",
+                    "global_name": "Alice",
+                    "avatar": null
+                },
+                "content": "hi <@u2>",
+                "timestamp": "2026-04-02T10:15:30.123456+00:00",
+                "edited_timestamp": null,
+                "mentions": [
+                    {
+                        "id": "u2",
+                        "username": "bob",
+                        "global_name": "Bob",
+                        "avatar": null
+                    }
+                ],
+                "attachments": [],
+                "message_reference": null,
+                "sticker_items": [
+                    {
+                        "id": "s1",
+                        "name": "wave",
+                        "format_type": 1
+                    }
+                ]
+            }
+        ]);
+
+        let rows_result = history_rows_from_value("dm1", payload);
+        assert!(
+            rows_result.is_ok(),
+            "history payload should parse: {rows_result:?}"
+        );
+        let rows = rows_result.unwrap_or_default();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].channel_id, "dm1");
+        assert_eq!(rows[0].content, "hi @Bob");
+    }
 
     #[test]
     fn parse_timestamp_iso_produces_hhmm() {

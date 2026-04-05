@@ -75,6 +75,10 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
             "Summarize unread".dim(),
         ]),
         Line::from(vec![
+            Span::styled(" r         ", theme::selected_item()),
+            "Refresh now".dim(),
+        ]),
+        Line::from(vec![
             Span::styled(" R         ", theme::selected_item()),
             "Mark all read".dim(),
         ]),

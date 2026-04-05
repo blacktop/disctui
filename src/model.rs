@@ -40,7 +40,6 @@ pub struct GuildSummary {
 pub struct ChannelSummary {
     pub id: String,
     pub guild_id: Option<String>,
-    #[cfg_attr(not(feature = "experimental-discord"), expect(dead_code))]
     pub parent_id: Option<String>,
     pub name: String,
     pub kind: ChannelKind,
@@ -63,6 +62,50 @@ impl ChannelSummary {
 
     pub const fn shows_unread_in_channel_list(&self) -> bool {
         self.unread && !self.muted
+    }
+}
+
+fn channel_summary_cmp(a: &ChannelSummary, b: &ChannelSummary) -> std::cmp::Ordering {
+    a.position.cmp(&b.position).then(a.name.cmp(&b.name))
+}
+
+pub(crate) fn sort_channels_for_sidebar(channels: &mut Vec<ChannelSummary>) {
+    channels.sort_by(channel_summary_cmp);
+
+    let mut uncategorized = Vec::new();
+    let mut categories = Vec::new();
+    let mut children: HashMap<String, Vec<ChannelSummary>> = HashMap::new();
+
+    for channel in channels.drain(..) {
+        match channel.kind {
+            ChannelKind::Category => categories.push(channel),
+            _ if channel.parent_id.is_none() => uncategorized.push(channel),
+            _ => {
+                debug_assert!(channel.parent_id.is_some());
+                let Some(parent_id) = channel.parent_id.clone() else {
+                    continue;
+                };
+                children.entry(parent_id).or_default().push(channel);
+            }
+        }
+    }
+
+    categories.sort_by(channel_summary_cmp);
+    uncategorized.sort_by(channel_summary_cmp);
+    for child_group in children.values_mut() {
+        child_group.sort_by(channel_summary_cmp);
+    }
+
+    channels.extend(uncategorized);
+    for category in categories {
+        let category_id = category.id.clone();
+        channels.push(category);
+        if let Some(group_children) = children.remove(&category_id) {
+            channels.extend(group_children);
+        }
+    }
+    for orphan_children in children.into_values() {
+        channels.extend(orphan_children);
     }
 }
 

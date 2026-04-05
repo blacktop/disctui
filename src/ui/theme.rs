@@ -4,6 +4,7 @@ pub const MUTE_GLYPH: &str = "⊘";
 pub const DISCORD_BLURPLE: Color = Color::Rgb(88, 101, 242);
 pub const DISCORD_BLURPLE_LIGHT: Color = Color::Rgb(121, 134, 255);
 pub const DISCORD_BG_DARK: Color = Color::Rgb(35, 39, 42);
+pub const DISCORD_RED: Color = Color::Rgb(237, 66, 69);
 
 // Pane border when focused
 pub fn focused_border() -> Style {
@@ -67,6 +68,10 @@ pub fn title() -> Style {
 // Error text
 pub fn error() -> Style {
     Style::new().fg(Color::Red)
+}
+
+pub fn new_messages_divider() -> Style {
+    Style::new().fg(DISCORD_RED).add_modifier(Modifier::BOLD)
 }
 
 // Dimmed / secondary text

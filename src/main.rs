@@ -377,14 +377,39 @@ fn execute_effect_discord(
                     format!("https://discord.com/api/v10/channels/{channel_id}/messages?limit=50");
                 let action = match http.get(&url).await {
                     Ok(value) => {
-                        let msgs: Vec<diself::Message> =
-                            serde_json::from_value(value).unwrap_or_default();
-                        let has_more = msgs.len() >= 50;
-                        let rows = transport::discord::messages_to_rows(&msgs);
-                        Action::HistoryLoaded {
-                            channel_id,
-                            messages: rows,
-                            has_more,
+                        let raw_count = value.as_array().map_or(0, Vec::len);
+                        let payload_summary = history_payload_summary(&value);
+                        match transport::discord::history_rows_from_value(&channel_id, value) {
+                            Ok(rows) => {
+                                let has_more = raw_count >= 50;
+                                tracing::debug!(
+                                    channel_id = %channel_id,
+                                    raw_count,
+                                    decoded_count = rows.len(),
+                                    has_more,
+                                    payload = %payload_summary,
+                                    "loaded discord history"
+                                );
+                                Action::HistoryLoaded {
+                                    channel_id,
+                                    messages: rows,
+                                    has_more,
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    channel_id = %channel_id,
+                                    raw_count,
+                                    error = %err,
+                                    payload = %payload_summary,
+                                    "failed to decode discord history payload"
+                                );
+                                Action::HistoryLoaded {
+                                    channel_id,
+                                    messages: Vec::new(),
+                                    has_more: false,
+                                }
+                            }
                         }
                     }
                     Err(e) => Action::LoadFailed {
@@ -426,6 +451,72 @@ fn connect_discord_with_token(token: &str, tx: &mpsc::Sender<Action>) -> Result<
     auth::log_tos_warning();
     let (client, handle) = transport::discord::connect(token.to_string(), tx.clone())?;
     Ok(DiscordState { client, handle })
+}
+
+#[cfg(feature = "experimental-discord")]
+fn history_payload_summary(value: &serde_json::Value) -> String {
+    let Some(entries) = value.as_array() else {
+        return match value {
+            serde_json::Value::Object(map) => {
+                let keys = map.keys().take(8).cloned().collect::<Vec<_>>().join(",");
+                format!("non-array object keys=[{keys}]")
+            }
+            other => format!("non-array payload type={}", json_type_name(other)),
+        };
+    };
+
+    let preview = entries
+        .iter()
+        .take(5)
+        .map(history_entry_summary)
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("entries={} preview=[{}]", entries.len(), preview)
+}
+
+#[cfg(feature = "experimental-discord")]
+fn history_entry_summary(entry: &serde_json::Value) -> String {
+    let id = entry
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+    let kind = entry
+        .get("type")
+        .and_then(serde_json::Value::as_u64)
+        .map_or_else(|| "?".to_string(), |value| value.to_string());
+    let flags = entry
+        .get("flags")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let content_len = entry
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .map_or(0, str::len);
+    let attachments = entry
+        .get("attachments")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len);
+    let author_id = entry
+        .get("author")
+        .and_then(|author| author.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("?");
+
+    format!(
+        "id={id} type={kind} author={author_id} content_len={content_len} attachments={attachments} flags={flags}"
+    )
+}
+
+#[cfg(feature = "experimental-discord")]
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 // --- Shared: AI summarization ---
