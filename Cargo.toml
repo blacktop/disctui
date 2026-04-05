@@ -1,6 +1,6 @@
 [package]
 name = "disctui"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2024"
 authors = ["blacktop"]
 description = "A fast, minimal Discord TUI with AI-powered conversation summaries"
