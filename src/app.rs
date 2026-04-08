@@ -61,10 +61,6 @@ impl FocusPane {
 pub enum ConnectionState {
     Connecting,
     Connected,
-    #[expect(
-        dead_code,
-        reason = "used when experimental-discord transport reconnects"
-    )]
     Reconnecting,
     Disconnected,
     MockTransport,
@@ -221,7 +217,10 @@ impl App {
         match action {
             Action::Quit => self.should_quit = true,
             Action::Tick => return self.tick(),
-            Action::Resize { .. } | Action::SubmitDiscordToken | Action::CancelDiscordToken => {}
+            Action::Resize { .. }
+            | Action::SubmitDiscordToken
+            | Action::CancelDiscordToken
+            | Action::ReconnectTransport => {}
             Action::LoadStarted(scope) => {
                 self.start_load_scope(scope);
             }
@@ -282,7 +281,7 @@ impl App {
                 self.finish_load_scope(&LoadScope::StartupConnect);
                 self.finish_load_scope(&LoadScope::GuildBootstrap);
                 self.connection_state = ConnectionState::Disconnected;
-                self.set_error(reason);
+                self.set_error(format!("{reason}. Press c to reconnect."));
             }
             Action::GuildsLoaded(g) => {
                 self.finish_load_scope(&LoadScope::GuildBootstrap);

@@ -41,7 +41,13 @@ pub fn render(
         _ => Span::styled(" -- ", theme::status_bar()),
     };
 
-    let hints = Span::styled(" q:quit  ?:help  Tab:focus  i:insert ", theme::dim());
+    let hints = match connection {
+        ConnectionState::Disconnected | ConnectionState::MockTransport => Span::styled(
+            " q:quit  c:reconnect  ?:help  Tab:focus  i:insert ",
+            theme::dim(),
+        ),
+        _ => Span::styled(" q:quit  ?:help  Tab:focus  i:insert ", theme::dim()),
+    };
 
     let mut spans = vec![app_span, Span::raw(" "), conn_span];
 

@@ -30,6 +30,7 @@ pub enum Action {
     ScrollDown(u16),
     OpenSelected,
     RefreshNow,
+    ReconnectTransport,
     LoadStarted(LoadScope),
     LoadFailed {
         scope: LoadScope,

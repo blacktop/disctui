@@ -212,7 +212,18 @@ fn process_action(
         return;
     }
 
+    #[cfg(feature = "experimental-discord")]
+    if handle_reconnect_action(&action, app, tx, discord, transport_started) {
+        return;
+    }
+
+    #[cfg(feature = "experimental-discord")]
+    let should_dispose_discord = matches!(action, Action::TransportDisconnected(_));
     let effects = app.update(action);
+    #[cfg(feature = "experimental-discord")]
+    if should_dispose_discord {
+        dispose_discord_state(discord, false);
+    }
     dispatch_effects(
         effects,
         tx,
@@ -220,6 +231,103 @@ fn process_action(
         #[cfg(feature = "experimental-discord")]
         discord.as_ref(),
     );
+}
+
+#[cfg(feature = "experimental-discord")]
+fn handle_reconnect_action(
+    action: &Action,
+    app: &mut App,
+    tx: &mpsc::Sender<Action>,
+    discord: &mut Option<DiscordState>,
+    transport_started: &mut bool,
+) -> bool {
+    if !matches!(action, Action::ReconnectTransport) {
+        return false;
+    }
+
+    match app.connection_state {
+        ConnectionState::Disconnected | ConnectionState::MockTransport => {
+            reconnect_discord(app, tx, discord, transport_started);
+        }
+        ConnectionState::Connected => {
+            let _ = app.update(Action::Error("Already connected".into()));
+        }
+        ConnectionState::Connecting | ConnectionState::Reconnecting => {
+            let _ = app.update(Action::Error("Reconnect already in progress".into()));
+        }
+    }
+    true
+}
+
+#[cfg(feature = "experimental-discord")]
+fn reconnect_discord(
+    app: &mut App,
+    tx: &mpsc::Sender<Action>,
+    discord: &mut Option<DiscordState>,
+    transport_started: &mut bool,
+) {
+    let preserve_mock_transport = app.connection_state == ConnectionState::MockTransport;
+    dispose_discord_state(discord, true);
+
+    let Ok(mut token) = auth::get_token() else {
+        show_reconnect_prompt(
+            app,
+            transport_started,
+            preserve_mock_transport,
+            "Reconnect requires a saved Discord token",
+        );
+        return;
+    };
+
+    app.start_load_scope(LoadScope::StartupConnect);
+    match connect_discord_with_token(&token, tx) {
+        Ok(state) => {
+            app.connection_state = ConnectionState::Reconnecting;
+            *discord = Some(state);
+            *transport_started = true;
+        }
+        Err(err) => {
+            app.finish_load_scope(&LoadScope::StartupConnect);
+            show_reconnect_prompt(
+                app,
+                transport_started,
+                preserve_mock_transport,
+                format!("Reconnect failed: {err}"),
+            );
+        }
+    }
+    token.zeroize();
+}
+
+#[cfg(feature = "experimental-discord")]
+fn show_reconnect_prompt(
+    app: &mut App,
+    transport_started: &mut bool,
+    preserve_mock_transport: bool,
+    message: impl Into<String>,
+) {
+    if !preserve_mock_transport {
+        *transport_started = false;
+    }
+    app.show_discord_token_prompt();
+    app.set_discord_token_prompt_error(message.into());
+}
+
+#[cfg(feature = "experimental-discord")]
+fn dispose_discord_state(discord: &mut Option<DiscordState>, shutdown: bool) {
+    let Some(state) = discord.take() else {
+        return;
+    };
+
+    if shutdown {
+        state.client.shutdown();
+    }
+
+    tokio::spawn(async move {
+        if let Err(err) = state.handle.await {
+            tracing::warn!("discord task join failed: {err}");
+        }
+    });
 }
 
 fn dispatch_effects(
