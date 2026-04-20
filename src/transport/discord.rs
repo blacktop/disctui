@@ -1,5 +1,6 @@
 #![cfg(feature = "experimental-discord")]
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -148,14 +149,15 @@ impl EventHandler for DiscordBridge {
             .cache
             .channel(&message.channel_id)
             .and_then(|channel| channel_to_summary(&channel));
+        let row = message_to_resolved_row(&ctx.http, &ctx.cache, &message, false).await;
         self.send(Action::MessageAppended {
-            message: message_to_row(&message, false),
+            message: row,
             channel_hint,
         });
     }
 
-    async fn on_message_update(&self, _ctx: &Context, message: Message) {
-        let mut row = message_to_row(&message, false);
+    async fn on_message_update(&self, ctx: &Context, message: Message) {
+        let mut row = message_to_resolved_row(&ctx.http, &ctx.cache, &message, false).await;
         row.edited = true;
         self.send(Action::MessagePatched(row));
     }
@@ -218,7 +220,7 @@ pub fn connect(
         diself::Client::builder(token, bridge)
             .map_err(|e| color_eyre::eyre::eyre!("failed to build discord client: {e}"))?
             .with_cache_config(CacheConfig {
-                cache_users: false,
+                cache_users: true,
                 cache_channels: true,
                 cache_guilds: false,
                 cache_relationships: false,
@@ -287,7 +289,7 @@ fn preferred_user_name<'a>(username: &'a str, global_name: Option<&'a str>) -> &
     global_name.unwrap_or(username)
 }
 
-fn render_message_content<'a, I>(content: &str, mentions: I, is_reply: bool) -> String
+fn replace_user_mentions<'a, I>(content: &str, mentions: I) -> String
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
@@ -299,11 +301,153 @@ where
         rendered = rendered.replace(&nick_tag, &format!("@{display_name}"));
     }
 
+    rendered
+}
+
+fn render_message_content<'a, I>(content: &str, mentions: I, is_reply: bool) -> String
+where
+    I: IntoIterator<Item = (&'a str, &'a str)>,
+{
+    let rendered = replace_user_mentions(content, mentions);
+
     if is_reply {
         return format!("↩ {rendered}");
     }
 
     rendered
+}
+
+fn apply_resolved_user_mentions(content: &mut String, resolved: &HashMap<String, String>) {
+    *content = replace_user_mentions(
+        content,
+        resolved
+            .iter()
+            .map(|(user_id, display_name)| (user_id.as_str(), display_name.as_str())),
+    );
+}
+
+fn mentioned_user_ids(content: &str) -> Vec<String> {
+    let bytes = content.as_bytes();
+    let mut ids = Vec::new();
+    let mut seen = HashSet::new();
+    let mut idx = 0usize;
+
+    while idx + 3 < bytes.len() {
+        if bytes[idx] != b'<' || bytes[idx + 1] != b'@' {
+            idx += 1;
+            continue;
+        }
+
+        let mut cursor = idx + 2;
+        if bytes.get(cursor) == Some(&b'!') {
+            cursor += 1;
+        }
+        let start_digits = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        if cursor > start_digits
+            && bytes.get(cursor) == Some(&b'>')
+            && let Ok(user_id) = std::str::from_utf8(&bytes[start_digits..cursor])
+            && seen.insert(user_id.to_string())
+        {
+            ids.push(user_id.to_string());
+            idx = cursor + 1;
+            continue;
+        }
+
+        idx += 1;
+    }
+
+    ids
+}
+
+async fn resolve_user_names(
+    http: &diself::HttpClient,
+    cache: &diself::Cache,
+    user_ids: impl IntoIterator<Item = String>,
+) -> HashMap<String, String> {
+    let users = diself::UsersManager;
+    let mut resolved = HashMap::new();
+
+    for user_id in user_ids {
+        if let Some(user) = cache.user(&user_id) {
+            resolved.insert(
+                user_id,
+                preferred_user_name(&user.username, user.global_name.as_deref()).to_string(),
+            );
+            continue;
+        }
+
+        match users.get_profile(http, &user_id).await {
+            Ok(profile) => {
+                if let Some(user) = profile.user {
+                    let display_name =
+                        preferred_user_name(&user.username, user.global_name.as_deref())
+                            .to_string();
+                    cache.cache_user(user);
+                    resolved.insert(user_id, display_name);
+                }
+            }
+            Err(err) => {
+                tracing::debug!(user_id, error = %err, "failed to resolve mention user profile");
+            }
+        }
+    }
+
+    resolved
+}
+
+async fn message_to_resolved_row(
+    http: &diself::HttpClient,
+    cache: &diself::Cache,
+    msg: &Message,
+    is_continuation: bool,
+) -> MessageRow {
+    let mut row = message_to_row(msg, is_continuation);
+    resolve_row_user_mentions(http, cache, &mut row).await;
+    row
+}
+
+pub async fn resolve_row_user_mentions(
+    http: &diself::HttpClient,
+    cache: &diself::Cache,
+    row: &mut MessageRow,
+) {
+    let unresolved_ids = mentioned_user_ids(&row.content);
+    if unresolved_ids.is_empty() {
+        return;
+    }
+
+    let resolved = resolve_user_names(http, cache, unresolved_ids).await;
+    if resolved.is_empty() {
+        return;
+    }
+
+    apply_resolved_user_mentions(&mut row.content, &resolved);
+}
+
+pub async fn resolve_rows_user_mentions(
+    http: &diself::HttpClient,
+    cache: &diself::Cache,
+    rows: &mut [MessageRow],
+) {
+    let unresolved_ids: HashSet<String> = rows
+        .iter()
+        .flat_map(|row| mentioned_user_ids(&row.content))
+        .collect();
+    if unresolved_ids.is_empty() {
+        return;
+    }
+
+    let resolved = resolve_user_names(http, cache, unresolved_ids).await;
+    if resolved.is_empty() {
+        return;
+    }
+
+    for row in rows {
+        apply_resolved_user_mentions(&mut row.content, &resolved);
+    }
 }
 
 struct AttachmentSummaryInput {
@@ -785,6 +929,21 @@ fn parse_discord_timestamp(ts: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mentioned_user_ids_extracts_unique_plain_and_nick_mentions() {
+        let ids = mentioned_user_ids("hi <@123> there <@!456> again <@123>");
+
+        assert_eq!(ids, vec!["123".to_string(), "456".to_string()]);
+    }
+
+    #[test]
+    fn replace_user_mentions_rewrites_leftover_user_tokens() {
+        let rendered =
+            replace_user_mentions("hi <@123> and <@!456>", [("123", "alice"), ("456", "bob")]);
+
+        assert_eq!(rendered, "hi @alice and @bob");
+    }
 
     #[test]
     fn history_rows_ignore_sticker_items_without_description() {

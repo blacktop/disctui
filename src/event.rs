@@ -53,6 +53,7 @@ fn map_normal_mode(key: &KeyEvent, focus: FocusPane) -> Option<Action> {
         KeyCode::Char('3') => Some(Action::SetFocus(FocusPane::Messages)),
         KeyCode::BackTab => Some(Action::FocusPrev),
         KeyCode::Enter => Some(Action::OpenSelected),
+        KeyCode::Char('x') => Some(Action::CloseSelectedDirectMessage),
         KeyCode::Char('i') => Some(Action::EnterInsert),
         KeyCode::Char('c') => Some(Action::ReconnectTransport),
         KeyCode::Char('r') => Some(Action::RefreshNow),
@@ -130,6 +131,15 @@ mod tests {
         assert!(matches!(
             map_terminal_event(&event, InputMode::Normal, FocusPane::Messages),
             Some(Action::ReconnectTransport)
+        ));
+    }
+
+    #[test]
+    fn x_key_triggers_close_direct_message() {
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(matches!(
+            map_terminal_event(&event, InputMode::Normal, FocusPane::Messages),
+            Some(Action::CloseSelectedDirectMessage)
         ));
     }
 }

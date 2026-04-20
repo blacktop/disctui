@@ -478,6 +478,7 @@ fn execute_effect_discord(
         }
         Effect::LoadHistory { channel_id } => {
             let http = ds.client.http().clone();
+            let cache = ds.client.cache().clone();
             let tx = tx.clone();
             let _ = tx.try_send(Action::LoadStarted(LoadScope::History(channel_id.clone())));
             tokio::spawn(async move {
@@ -488,7 +489,11 @@ fn execute_effect_discord(
                         let raw_count = value.as_array().map_or(0, Vec::len);
                         let payload_summary = history_payload_summary(&value);
                         match transport::discord::history_rows_from_value(&channel_id, value) {
-                            Ok(rows) => {
+                            Ok(mut rows) => {
+                                transport::discord::resolve_rows_user_mentions(
+                                    &http, &cache, &mut rows,
+                                )
+                                .await;
                                 let has_more = raw_count >= 50;
                                 tracing::debug!(
                                     channel_id = %channel_id,

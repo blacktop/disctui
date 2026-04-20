@@ -127,6 +127,9 @@ pub struct App {
     unread_divider_anchor: Option<UnreadDividerAnchor>,
     /// Message id before which the "new messages" divider should be rendered.
     unread_divider_message_id: Option<String>,
+    /// Locally closed DM channel ids, hidden from the visible sidebar until they receive
+    /// another message.
+    closed_direct_messages: HashSet<String>,
     /// Channels per guild, populated from `GUILD_CREATE` events.
     guild_channels: HashMap<String, Vec<ChannelSummary>>,
     /// User mute preferences from Discord notification settings.
@@ -173,6 +176,7 @@ impl App {
             read_watermark: 0,
             unread_divider_anchor: None,
             unread_divider_message_id: None,
+            closed_direct_messages: HashSet::new(),
             guild_channels: HashMap::new(),
             guild_mute_settings: HashMap::new(),
             active_loads: BTreeSet::new(),
@@ -249,6 +253,7 @@ impl App {
             Action::JumpTop => self.jump_to_boundary(true),
             Action::JumpBottom => self.jump_to_boundary(false),
             Action::MarkAllRead => self.mark_all_read(),
+            Action::CloseSelectedDirectMessage => return self.close_selected_direct_message(),
             Action::RefreshNow => return self.refresh_now(),
             Action::OpenSelected => return self.open_selected(),
             Action::EnterInsert | Action::StartQuickReplyFromSummary => {
@@ -531,6 +536,61 @@ impl App {
 
     fn set_error(&mut self, msg: String) {
         self.status_error = Some((msg, Instant::now()));
+    }
+
+    fn sync_closed_direct_messages_from_store(&mut self) {
+        let Some(store) = self.store.as_deref() else {
+            return;
+        };
+        self.closed_direct_messages = store.closed_direct_messages();
+    }
+
+    fn filter_closed_direct_messages(
+        channels: &mut Vec<ChannelSummary>,
+        closed_direct_messages: &HashSet<String>,
+    ) {
+        channels.retain(|channel| {
+            channel.kind != ChannelKind::DirectMessage
+                || !closed_direct_messages.contains(&channel.id)
+        });
+    }
+
+    fn reopen_direct_message(&mut self, channel_id: &str) -> bool {
+        let reopened = self.closed_direct_messages.remove(channel_id);
+        if reopened && let Some(store) = self.store.as_deref() {
+            store.reopen_direct_message(channel_id);
+        }
+        reopened
+    }
+
+    fn is_direct_messages_guild(guild_id: &str) -> bool {
+        guild_id == DIRECT_MESSAGES_GUILD_ID
+    }
+
+    fn apply_closed_direct_message_filter_for_guild(
+        guild_id: &str,
+        channels: &mut Vec<ChannelSummary>,
+        closed_direct_messages: &HashSet<String>,
+    ) {
+        if Self::is_direct_messages_guild(guild_id) {
+            Self::filter_closed_direct_messages(channels, closed_direct_messages);
+        }
+    }
+
+    fn selected_closeable_direct_message_id(&self) -> Option<String> {
+        let channel_id = match self.focus {
+            FocusPane::Channels => self
+                .channel_state
+                .selected()
+                .and_then(|index| self.channels.get(index))
+                .map(|channel| channel.id.clone()),
+            FocusPane::Messages => self.selected_channel_id.clone(),
+            _ => None,
+        }?;
+
+        self.find_channel(&channel_id)
+            .filter(|channel| channel.kind == ChannelKind::DirectMessage)
+            .map(|_| channel_id)
     }
 
     fn apply_local_read_state_to_channels(store: &Store, channels: &mut [ChannelSummary]) -> u32 {
@@ -939,6 +999,11 @@ impl App {
         // Load channels for this guild (may be empty if guild arrived via lazy load)
         if let Some(channels) = self.guild_channels.get(&guild_id) {
             self.channels = channels.clone();
+            Self::apply_closed_direct_message_filter_for_guild(
+                &guild_id,
+                &mut self.channels,
+                &self.closed_direct_messages,
+            );
             self.channel_state = ListState::default();
             if let Some(ch_idx) = self.first_selectable_channel_index() {
                 self.channel_state.select(Some(ch_idx));
@@ -1172,6 +1237,7 @@ impl App {
 
     fn handle_guilds_loaded(&mut self, guilds: Vec<GuildSummary>) -> Vec<Effect> {
         let mut guilds = guilds;
+        self.sync_closed_direct_messages_from_store();
         Self::ensure_direct_messages_guild(&mut guilds);
         Self::apply_guild_mute_settings(
             &mut guilds,
@@ -1201,6 +1267,7 @@ impl App {
     ) -> Vec<Effect> {
         let mut guilds = guilds;
         let mut channels = channels;
+        self.sync_closed_direct_messages_from_store();
         Self::ensure_direct_messages_guild(&mut guilds);
         self.guild_mute_settings = guild_mute_settings;
         Self::apply_guild_mute_settings(&mut guilds, &mut channels, &self.guild_mute_settings);
@@ -1327,6 +1394,13 @@ impl App {
             return Vec::new();
         }
 
+        if let Some(guild_id) = guild_id {
+            Self::apply_closed_direct_message_filter_for_guild(
+                guild_id,
+                &mut channels,
+                &self.closed_direct_messages,
+            );
+        }
         self.channels = channels;
         self.channel_state = ListState::default();
         if let Some(selected_channel_id) = previous_selected_channel_id.as_deref()
@@ -1455,11 +1529,22 @@ impl App {
         let channel_id = &msg.channel_id;
         let msg_id = msg.id.clone();
         let mut affected_guild_id: Option<String> = None;
+        let reopened_direct_message = self.reopen_direct_message(channel_id);
         let mut matched_channel = false;
         for channels in self.guild_channels.values_mut() {
             if let Some(ch) = channels.iter_mut().find(|c| c.id == *channel_id) {
                 mark_channel_unread(ch, &msg_id);
                 affected_guild_id.clone_from(&ch.guild_id);
+                if reopened_direct_message
+                    && self.selected_guild_id.as_deref() == Some(DIRECT_MESSAGES_GUILD_ID)
+                    && !self.channels.iter().any(|channel| channel.id == ch.id)
+                {
+                    let mut visible_channel = ch.clone();
+                    visible_channel.unread = false;
+                    visible_channel.unread_count = 0;
+                    self.channels.push(visible_channel);
+                    self.sort_visible_channels();
+                }
                 matched_channel = true;
                 break;
             }
@@ -1661,6 +1746,11 @@ impl App {
         // Use cached channels from GUILD_CREATE if available
         if let Some(channels) = self.guild_channels.get(&guild_id) {
             self.channels = channels.clone();
+            Self::apply_closed_direct_message_filter_for_guild(
+                &guild_id,
+                &mut self.channels,
+                &self.closed_direct_messages,
+            );
             self.channel_state = ListState::default();
             if let Some(idx) = self.first_selectable_channel_index() {
                 self.channel_state.select(Some(idx));
@@ -1745,6 +1835,67 @@ impl App {
         }
 
         vec![Effect::LoadHistory { channel_id }]
+    }
+
+    fn close_selected_direct_message(&mut self) -> Vec<Effect> {
+        let Some(channel_id) = self.selected_closeable_direct_message_id() else {
+            self.set_error("No direct message selected".into());
+            return Vec::new();
+        };
+        let Some(channel) = self.find_channel(&channel_id).cloned() else {
+            self.set_error("No direct message selected".into());
+            return Vec::new();
+        };
+
+        if let Some(store) = self.store.as_deref() {
+            store.close_direct_message(&channel_id);
+        }
+
+        if let Some(last_message_id) = channel.last_message_id.as_deref().or_else(|| {
+            (self.selected_channel_id.as_deref() == Some(channel_id.as_str()))
+                .then(|| self.messages.last().map(|message| message.id.as_str()))
+                .flatten()
+        }) && let Some(store) = self.store.as_deref()
+        {
+            store.mark_read(&channel_id, last_message_id);
+        }
+
+        self.closed_direct_messages.insert(channel_id.clone());
+
+        for channels in self.guild_channels.values_mut() {
+            if let Some(existing) = channels
+                .iter_mut()
+                .find(|existing| existing.id == channel_id)
+            {
+                existing.unread = false;
+                existing.unread_count = 0;
+                break;
+            }
+        }
+
+        self.channels.retain(|existing| existing.id != channel_id);
+        if let Some(guild_id) = self.selected_guild_id.clone() {
+            self.sync_guild_unread_from_channels(&guild_id);
+        }
+
+        if self.selected_channel_id.as_deref() == Some(channel_id.as_str()) {
+            self.selected_channel_id = None;
+            self.messages.clear();
+            self.message_scroll_offset = 0;
+            self.read_watermark = 0;
+            self.unread_divider_anchor = None;
+            self.unread_divider_message_id = None;
+            self.message_pane_view = MessagePaneView::Messages;
+            self.summary_state = SummaryPaneState::default();
+            self.focus = FocusPane::Channels;
+        }
+
+        self.channel_state = ListState::default();
+        if let Some(index) = self.first_selectable_channel_index() {
+            self.channel_state.select(Some(index));
+        }
+
+        Vec::new()
     }
 
     fn selectable_channel_indices(&self) -> Vec<usize> {
@@ -2184,6 +2335,78 @@ mod tests {
             .unwrap();
         assert!(!dm.unread);
         assert_eq!(dm.unread_count, 0);
+    }
+
+    #[test]
+    fn close_selected_direct_message_hides_it_from_visible_dm_list() {
+        let store = std::rc::Rc::new(Store::open_in_memory());
+        let mut app = app_with_guilds();
+        app.store = Some(store.clone());
+
+        let guild_id = load_direct_messages(&mut app);
+        app.update(Action::ChannelsLoaded {
+            guild_id: Some(guild_id),
+            channels: mock::channels(DIRECT_MESSAGES_GUILD_ID),
+        });
+
+        let dm_index = app
+            .channels
+            .iter()
+            .position(|channel| channel.id == "dm1")
+            .unwrap();
+        app.channel_state.select(Some(dm_index));
+        app.focus = FocusPane::Channels;
+
+        app.update(Action::CloseSelectedDirectMessage);
+
+        assert!(!app.channels.iter().any(|channel| channel.id == "dm1"));
+        assert!(store.closed_direct_messages().contains("dm1"));
+    }
+
+    #[test]
+    fn closed_direct_message_reappears_when_new_message_arrives() {
+        let store = std::rc::Rc::new(Store::open_in_memory());
+        let mut app = app_with_guilds();
+        app.store = Some(store.clone());
+
+        let guild_id = load_direct_messages(&mut app);
+        app.update(Action::ChannelsLoaded {
+            guild_id: Some(guild_id),
+            channels: mock::channels(DIRECT_MESSAGES_GUILD_ID),
+        });
+
+        let dm_index = app
+            .channels
+            .iter()
+            .position(|channel| channel.id == "dm1")
+            .unwrap();
+        app.channel_state.select(Some(dm_index));
+        app.focus = FocusPane::Channels;
+        app.update(Action::CloseSelectedDirectMessage);
+
+        app.update(Action::MessageAppended {
+            message: MessageRow {
+                id: "dm1-new".into(),
+                channel_id: "dm1".into(),
+                author: "alice".into(),
+                author_avatar_url: None,
+                content: "ping".into(),
+                attachments: Vec::new(),
+                timestamp: "10:30".into(),
+                edited: false,
+                is_continuation: false,
+            },
+            channel_hint: None,
+        });
+
+        let dm = app
+            .channels
+            .iter()
+            .find(|channel| channel.id == "dm1")
+            .unwrap();
+        assert!(dm.unread);
+        assert_eq!(dm.unread_count, 1);
+        assert!(!store.closed_direct_messages().contains("dm1"));
     }
 
     #[test]

@@ -32,6 +32,10 @@ impl Store {
                 last_message_id TEXT NOT NULL,
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
+            CREATE TABLE IF NOT EXISTS closed_direct_messages (
+                channel_id TEXT PRIMARY KEY,
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );
             CREATE TABLE IF NOT EXISTS session (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
@@ -89,6 +93,51 @@ impl Store {
             .ok()
     }
 
+    /// List locally closed DM channel ids.
+    pub fn closed_direct_messages(&self) -> std::collections::HashSet<String> {
+        let mut closed = std::collections::HashSet::new();
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT channel_id FROM closed_direct_messages")
+        else {
+            return closed;
+        };
+
+        let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+            return closed;
+        };
+
+        for channel_id in rows.flatten() {
+            closed.insert(channel_id);
+        }
+
+        closed
+    }
+
+    /// Mark a DM channel as locally closed.
+    pub fn close_direct_message(&self, channel_id: &str) {
+        let result = self.conn.execute(
+            "INSERT INTO closed_direct_messages (channel_id, updated_at)
+             VALUES (?1, strftime('%s','now'))
+             ON CONFLICT(channel_id) DO UPDATE SET updated_at = excluded.updated_at",
+            [channel_id],
+        );
+        if let Err(e) = result {
+            tracing::warn!("failed to close direct message: {e}");
+        }
+    }
+
+    /// Remove the local closed-DM marker so the channel becomes visible again.
+    pub fn reopen_direct_message(&self, channel_id: &str) {
+        let result = self.conn.execute(
+            "DELETE FROM closed_direct_messages WHERE channel_id = ?1",
+            [channel_id],
+        );
+        if let Err(e) = result {
+            tracing::warn!("failed to reopen direct message: {e}");
+        }
+    }
+
     #[cfg(test)]
     #[expect(clippy::unwrap_used, reason = "in-memory store helper is test-only")]
     pub fn open_in_memory() -> Self {
@@ -97,6 +146,10 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS read_state (
                 channel_id TEXT PRIMARY KEY,
                 last_message_id TEXT NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+            );
+            CREATE TABLE IF NOT EXISTS closed_direct_messages (
+                channel_id TEXT PRIMARY KEY,
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
             );
             CREATE TABLE IF NOT EXISTS session (
@@ -136,5 +189,17 @@ mod tests {
         assert_eq!(store.last_read_message("ch1").unwrap(), "100");
         store.mark_read("ch1", "200");
         assert_eq!(store.last_read_message("ch1").unwrap(), "200");
+    }
+
+    #[test]
+    fn close_direct_message_round_trip() {
+        let store = test_store();
+        assert!(store.closed_direct_messages().is_empty());
+
+        store.close_direct_message("dm1");
+        assert!(store.closed_direct_messages().contains("dm1"));
+
+        store.reopen_direct_message("dm1");
+        assert!(!store.closed_direct_messages().contains("dm1"));
     }
 }

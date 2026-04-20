@@ -79,6 +79,10 @@ pub fn render_help(frame: &mut Frame, area: Rect) {
             "Refresh now".dim(),
         ]),
         Line::from(vec![
+            Span::styled(" x         ", theme::selected_item()),
+            "Close direct message".dim(),
+        ]),
+        Line::from(vec![
             Span::styled(" c         ", theme::selected_item()),
             "Connect/reconnect Discord".dim(),
         ]),
