@@ -1,67 +1,140 @@
-set shell := ["bash", "-cu"]
+set shell := ["bash", "-euo", "pipefail", "-c"]
+set positional-arguments
 
+# List available commands.
 default:
     @just --list
 
+# Build the release binary with Discord support.
 build:
-    cargo build --features experimental-discord
+    cargo build --release --locked --features experimental-discord
+    target/release/disctui --version
 
-release:
-    cargo build --release --features experimental-discord
-
+# Run the TUI, or a subcommand such as `just run digest --since 12h`.
 run *args:
-    cargo run --features experimental-discord -- {{args}}
+    cargo run --features experimental-discord -- "$@"
 
-fmt:
-    cargo fmt --all
+# Build and install the release binary into ~/.cargo/bin.
+install: build
+    install -d "$HOME/.cargo/bin"
+    install -m 755 target/release/disctui "$HOME/.cargo/bin/"
 
-lint:
-    cargo clippy --all --benches --tests --examples --all-features
+# Install the binary, then add its Rex command palette actions to Rex.
+install-rex: install
+    DISCTUI_BIN="$HOME/.cargo/bin/disctui" rex/install.sh
 
-test:
-    cargo test --all-features
-    cargo test
-
+# Check formatting, lints, and tests with and without Discord support.
 check:
-    just fmt
-    just lint
-    just test
+    cargo fmt --check
+    cargo clippy --all-targets --all-features --locked -- -D warnings
+    cargo clippy --all-targets --locked -- -D warnings
+    cargo test --all-features --locked -- --quiet
+    cargo test --locked -- --quiet
 
+# Follow the debug log written by `disctui --debug`.
 logs:
-    tail -f "${HOME}/Library/Application Support/disctui/disctui.log"
+    tail -f "$HOME/Library/Application Support/disctui/disctui.log"
 
-version:
-    @grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/'
+# Validate the workflows and GoReleaser configuration.
+release-check:
+    just --fmt --check
+    actionlint .github/workflows/*.yml
+    zizmor --offline .github/workflows/
+    goreleaser check
 
-# Requires cargo-release: cargo install cargo-release
-bump: bump-patch
+# Build local release archives without publishing them.
+package:
+    goreleaser release --snapshot --clean
 
-# Requires cargo-release: cargo install cargo-release
-bump-patch:
-    cargo release patch --execute --no-publish
+# Publish the checked-out tag; called by GitHub Actions.
+[private]
+release-publish:
+    goreleaser release --clean
 
-# Requires cargo-release: cargo install cargo-release
-bump-minor:
-    cargo release minor --execute --no-publish
+[private]
+check-version version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dt_tag="$1"
+    if [[ ! "$dt_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+        printf 'Invalid release tag %q; expected vMAJOR.MINOR.PATCH\n' "$dt_tag" >&2
+        exit 1
+    fi
+    dt_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+    if [[ "${dt_tag#v}" != "$dt_version" ]]; then
+        printf 'Tag %s does not match Cargo.toml version %s\n' "$dt_tag" "$dt_version" >&2
+        exit 1
+    fi
 
-# Requires cargo-release: cargo install cargo-release
-bump-major:
-    cargo release major --execute --no-publish
+# Enforce release provenance in GitHub Actions, independently of the tag command.
+[private]
+verify-release-tag version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dt_tag="$1"
+    just check-version "$dt_tag"
+    dt_ref="refs/tags/$dt_tag"
+    if [[ "$(git cat-file -t "$dt_ref")" != tag ]]; then
+        printf 'Release tag %s must be annotated and signed\n' "$dt_tag" >&2
+        exit 1
+    fi
+    dt_object=$(git rev-parse --verify "$dt_ref")
+    dt_commit=$(git rev-parse --verify "$dt_ref^{commit}")
+    if [[ "$dt_commit" != "$(git rev-parse --verify 'HEAD^{commit}')" ]]; then
+        printf 'Release checkout does not match tag %s\n' "$dt_tag" >&2
+        exit 1
+    fi
+    dt_verified=$(gh api "repos/blacktop/disctui/git/tags/$dt_object" --jq '.verification.verified')
+    if [[ "$dt_verified" != true ]]; then
+        printf 'GitHub has not verified the signature on tag %s\n' "$dt_tag" >&2
+        exit 1
+    fi
+    git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+    if ! git merge-base --is-ancestor "$dt_commit" refs/remotes/origin/main; then
+        printf 'Release tag %s is not in origin/main history\n' "$dt_tag" >&2
+        exit 1
+    fi
 
-# Requires cargo-release: cargo install cargo-release
-bump-dry level="patch":
-    cargo release {{level}}
-
-tag version:
-    @echo "Creating tag v{{version}}..."
-    git tag -a "v{{version}}" -m "Release v{{version}}"
-    git push origin "v{{version}}"
-
-dist-generate:
-    cargo dist generate
-
-dist-plan:
-    cargo dist plan
-
-dist-build:
-    cargo dist build --artifacts=local
+# Check, sign, and push a stable release tag, for example: just release v0.2.0.
+release version:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dt_tag="$1"
+    just check-version "$dt_tag"
+    dt_head=$(git rev-parse --verify 'HEAD^{commit}')
+    dt_ref="refs/tags/$dt_tag"
+    dt_require_main() {
+        local dt_branch dt_current dt_status dt_remote
+        dt_branch=$(git branch --show-current)
+        dt_current=$(git rev-parse --verify 'HEAD^{commit}')
+        dt_status=$(git status --porcelain)
+        if [[ "$dt_branch" != main || "$dt_current" != "$dt_head" || -n "$dt_status" ]]; then
+            printf 'Release requires a clean main checkout at %s\n' "$dt_head" >&2
+            exit 1
+        fi
+        dt_remote=$(git ls-remote --exit-code origin refs/heads/main)
+        if [[ "$dt_remote" != "$dt_head"$'\trefs/heads/main' ]]; then
+            printf 'Push main before releasing; origin/main must match %s\n' "$dt_head" >&2
+            exit 1
+        fi
+    }
+    dt_require_main
+    if git show-ref --verify --quiet "$dt_ref"; then
+        printf 'Tag %s already exists locally; inspect it before retrying a push\n' "$dt_tag" >&2
+        exit 1
+    fi
+    dt_remote_tag=$(git ls-remote --tags origin "$dt_ref")
+    if [[ -n "$dt_remote_tag" ]]; then
+        printf 'Tag %s already exists on origin\n' "$dt_tag" >&2
+        exit 1
+    fi
+    just check
+    just build
+    just release-check
+    dt_require_main
+    git tag -s "$dt_tag" "$dt_head" -m "Release $dt_tag"
+    if ! git push --no-follow-tags origin "$dt_ref"; then
+        printf 'Tag %s remains local. After resolving the push failure, retry: git push --no-follow-tags origin %s\n' "$dt_tag" "$dt_ref" >&2
+        exit 1
+    fi
+    printf 'Pushed %s; GitHub Actions will publish the release and Homebrew cask.\n' "$dt_tag"

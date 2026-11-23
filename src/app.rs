@@ -4,13 +4,15 @@ use std::time::Instant;
 
 use ratatui::widgets::ListState;
 
-use crate::action::Action;
+use crate::action::{Action, Origin};
+use crate::digest::{DigestOptions, DigestReport, Include, PreparedDigest};
 use crate::effect::Effect;
 use crate::model::{
     ChannelDigest, ChannelKind, ChannelSummary, DIRECT_MESSAGES_GUILD_ID,
     DIRECT_MESSAGES_GUILD_NAME, GuildMuteSettings, GuildSummary, LoadScope, MessageRow,
     sort_channels_for_sidebar,
 };
+use crate::status::{Report, State};
 use crate::store::{self, Store};
 use crate::ui::media::AvatarStore;
 
@@ -29,15 +31,6 @@ pub enum FocusPane {
 }
 
 impl FocusPane {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Guilds => "Guilds",
-            Self::Channels => "Channels",
-            Self::Messages => "Messages",
-            Self::Input => "Input",
-        }
-    }
-
     fn next(self) -> Self {
         match self {
             Self::Guilds => Self::Channels,
@@ -61,8 +54,13 @@ impl FocusPane {
 pub enum ConnectionState {
     Connecting,
     Connected,
+    #[cfg_attr(
+        not(feature = "experimental-discord"),
+        expect(dead_code, reason = "only the live Discord transport reconnects")
+    )]
     Reconnecting,
     Disconnected,
+    SessionExpired,
     MockTransport,
 }
 
@@ -79,10 +77,139 @@ pub struct SummaryPaneState {
     pub last_digest: Option<ChannelDigest>,
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct DiscordTokenPromptState {
-    pub input: String,
+#[derive(Default)]
+pub struct DigestPaneState {
+    pub rail_selected: bool,
+    pub visible: bool,
+    pub list: ListState,
+    pub report: Option<DigestReport>,
+    pub job: Option<Instant>,
+    pub waiting_for_channels: Option<LoadScope>,
+}
+
+impl DigestPaneState {
+    fn move_selection(&mut self, delta: isize) {
+        let count = self
+            .report
+            .as_ref()
+            .map_or(0, |report| report.rows().count());
+        if count != 0 {
+            let current = self.list.selected().unwrap_or_default();
+            self.list
+                .select(Some(current.saturating_add_signed(delta).min(count - 1)));
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserAccount {
+    pub name: String,
+    pub guilds: Vec<GuildSummary>,
+    pub selection: ListState,
+}
+
+impl BrowserAccount {
+    #[cfg(any(feature = "experimental-discord", test))]
+    pub fn new(name: String, guilds: Vec<GuildSummary>) -> Self {
+        let selection = ListState::default().with_selected((!guilds.is_empty()).then_some(0));
+        Self {
+            name,
+            guilds,
+            selection,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(
+    all(not(feature = "experimental-discord"), not(test)),
+    expect(dead_code, reason = "browser authorization needs Discord support")
+)]
+pub enum BrowserPhase {
+    AccountReady,
+    Restore,
+    Ready,
+    Waiting,
+    SignedIn(BrowserAccount),
+    SigningOut(BrowserAccount),
+}
+
+/// How far Discord's own sign-in window has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    all(not(feature = "experimental-discord"), not(test)),
+    expect(dead_code, reason = "the sign-in window needs Discord support")
+)]
+pub enum WebStage {
+    /// Opening the window.
+    Starting,
+    /// Discord's page is up; the user is signing in there.
+    Waiting,
+    /// Checking the session the page handed back.
+    Verifying,
+    /// Saved in the Keychain; opening the message connection.
+    Connecting,
+}
+
+#[cfg_attr(
+    all(not(feature = "experimental-discord"), not(test)),
+    expect(dead_code, reason = "the sign-in window needs Discord support")
+)]
+impl WebStage {
+    /// Read a stage word reported by the sign-in window.
+    pub fn parse(stage: &str) -> Option<Self> {
+        match stage {
+            "waiting" => Some(Self::Waiting),
+            "verifying" | "rejected" => Some(Self::Verifying),
+            "ready" | "saved" => Some(Self::Connecting),
+            _ => None,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Starting => "Opening Discord's sign-in window",
+            Self::Waiting => "Waiting for Discord",
+            Self::Verifying => "Verifying session",
+            Self::Connecting => "Connecting to messages",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SignInMode {
+    #[cfg_attr(
+        all(not(feature = "experimental-discord"), not(test)),
+        expect(dead_code, reason = "browser authorization needs Discord support")
+    )]
+    Browser(BrowserPhase),
+    /// Discord's own sign-in window, running beside the terminal.
+    #[cfg_attr(
+        not(feature = "experimental-discord"),
+        expect(dead_code, reason = "the sign-in window needs Discord support")
+    )]
+    Web(WebStage),
+    /// Pasting a user token by hand.
+    Token { input: String },
+}
+
+/// The modal sign-in prompt shown while there is no usable Discord token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignInState {
+    pub mode: SignInMode,
+    /// Why the last attempt to use a token failed.
     pub error: Option<String>,
+}
+
+/// Search budget after sign-in and startup, about 30 seconds at the default tick rate.
+const PENDING_OPEN_MAX_TICKS: u32 = 120;
+
+#[derive(Debug, Clone)]
+struct PendingOpen {
+    channel_id: String,
+    ticks_waited: u32,
+    /// Servers whose channel list was already requested for this open.
+    requested_guilds: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -97,7 +224,7 @@ pub struct App {
     pub focus: FocusPane,
     pub should_quit: bool,
     pub show_help: bool,
-    discord_token_prompt: Option<DiscordTokenPromptState>,
+    sign_in: Option<SignInState>,
     pub connection_state: ConnectionState,
     pub guilds: Vec<GuildSummary>,
     pub guild_state: ListState,
@@ -113,9 +240,13 @@ pub struct App {
     pub at_bottom: bool,
     pub message_pane_view: MessagePaneView,
     pub summary_state: SummaryPaneState,
+    pub digest: DigestPaneState,
+    /// The configured digest whitelist. The sample digest ignores it.
+    pub digest_include: Vec<Include>,
     pub input_text: String,
     pub current_username: String,
     status_error: Option<(String, Instant)>,
+    history_error: Option<(String, String)>,
     next_message_id: u64,
     pub store: Option<Rc<Store>>,
     /// True if we tried to restore the session but channels weren't available yet.
@@ -132,17 +263,21 @@ pub struct App {
     closed_direct_messages: HashSet<String>,
     /// Channels per guild, populated from `GUILD_CREATE` events.
     guild_channels: HashMap<String, Vec<ChannelSummary>>,
+    /// Guilds known only through individual message hints until a full channel list arrives.
+    partial_channel_lists: HashSet<String>,
     /// User mute preferences from Discord notification settings.
     guild_mute_settings: HashMap<String, GuildMuteSettings>,
     /// Active user-visible async loads for progress rendering.
     active_loads: BTreeSet<LoadScope>,
     /// Tick counter for periodic refresh (every ~10s at 250ms tick rate).
     tick_count: u32,
+    /// Channel requested by `--open` or the control socket before its server loaded.
+    pending_open_channel: Option<PendingOpen>,
     pub avatars: AvatarStore,
 }
 
 impl App {
-    #[cfg_attr(not(test), expect(dead_code, reason = "test helper constructor"))]
+    /// App without terminal image support: used by headless commands and tests.
     pub fn new() -> Self {
         Self::new_with_avatars(AvatarStore::fallback())
     }
@@ -153,7 +288,7 @@ impl App {
             focus: FocusPane::Guilds,
             should_quit: false,
             show_help: false,
-            discord_token_prompt: None,
+            sign_in: None,
             connection_state: ConnectionState::MockTransport,
             guilds: Vec::new(),
             guild_state: ListState::default(),
@@ -167,10 +302,13 @@ impl App {
             at_bottom: true,
             message_pane_view: MessagePaneView::Messages,
             summary_state: SummaryPaneState::default(),
+            digest: DigestPaneState::default(),
+            digest_include: Vec::new(),
             input_text: String::new(),
             current_username: "you".into(),
             session_restore_pending: false,
             status_error: None,
+            history_error: None,
             next_message_id: 1000,
             store: None,
             read_watermark: 0,
@@ -178,9 +316,11 @@ impl App {
             unread_divider_message_id: None,
             closed_direct_messages: HashSet::new(),
             guild_channels: HashMap::new(),
+            partial_channel_lists: HashSet::new(),
             guild_mute_settings: HashMap::new(),
             active_loads: BTreeSet::new(),
             tick_count: 0,
+            pending_open_channel: None,
             avatars,
         }
     }
@@ -196,39 +336,90 @@ impl App {
         reason = "central app reducer keeps modal and pane transitions in one match"
     )]
     pub fn update(&mut self, action: Action) -> Vec<Effect> {
-        // Startup token prompt is modal: only allow quitting, ticks, and resizes.
-        if self.discord_token_prompt.is_some() {
+        // Queue external opens until sign-in and bootstrap finish.
+        if self.sign_in.is_some() {
             match action {
                 Action::Quit => {}
+                Action::MoveUp => {
+                    self.move_account_selection(-1);
+                    return Vec::new();
+                }
+                Action::MoveDown => {
+                    self.move_account_selection(1);
+                    return Vec::new();
+                }
+                Action::OpenSelected => {
+                    self.explain_account_guild();
+                    return Vec::new();
+                }
                 Action::Tick | Action::Resize { .. } => {
                     return self.tick();
                 }
+                Action::OpenChannel(channel_id) => return self.request_open_channel(channel_id),
+                _ if action.origin() == Origin::Delivered => {}
                 _ => return Vec::new(),
             }
         }
 
-        // Help popup is modal: only allow closing it, quitting, ticks, and resizes
+        // Help popup is modal for input: keys only close it or quit. Whatever the
+        // transport, the AI backend, or the control socket delivers still applies.
         if self.show_help {
-            match action {
-                Action::ToggleHelp | Action::Quit => {}
-                Action::Tick | Action::Resize { .. } => {
-                    return self.tick();
-                }
-                _ => return Vec::new(),
+            let closes_help = matches!(action, Action::ToggleHelp | Action::Quit);
+            match action.origin() {
+                Origin::Clock => return self.tick(),
+                Origin::Input if !closes_help => return Vec::new(),
+                Origin::Input | Origin::Delivered => {}
             }
         }
 
         match action {
             Action::Quit => self.should_quit = true,
             Action::Tick => return self.tick(),
+            // Sign-in actions only mean something while the prompt is up.
             Action::Resize { .. }
             | Action::SubmitDiscordToken
             | Action::CancelDiscordToken
+            | Action::ShowTokenEntry
+            | Action::LeaveTokenEntry
             | Action::ReconnectTransport => {}
+            #[cfg(feature = "experimental-discord")]
+            Action::MessageSessionRejected { .. } => {}
+            #[cfg(feature = "experimental-discord")]
+            Action::BrowserSignIn
+            | Action::BrowserSignOut
+            | Action::CancelBrowser
+            | Action::WebSignIn
+            | Action::WebSignInProgress(_)
+            | Action::WebSignInSaved
+            | Action::WebSignInFailed(_) => {}
             Action::LoadStarted(scope) => {
+                if matches!(&scope, LoadScope::History(id) if self.selected_channel_id.as_ref() == Some(id))
+                {
+                    self.history_error = None;
+                }
                 self.start_load_scope(scope);
             }
             Action::LoadFailed { scope, message } => {
+                if self.digest.waiting_for_channels.as_ref() == Some(&scope) {
+                    self.finish_load_scope(&scope);
+                    if let LoadScope::ChannelList(id) = &scope
+                        && self.has_channel_list(id)
+                    {
+                        // A gateway event already supplied the list while REST was in flight.
+                        return Vec::new();
+                    }
+                    self.digest.waiting_for_channels = None;
+                    self.set_error(format!(
+                        "Digest could not load channels: {message}. Press S to retry."
+                    ));
+                    return Vec::new();
+                }
+
+                if let LoadScope::History(id) = &scope
+                    && self.selected_channel_id.as_ref() == Some(id)
+                {
+                    self.history_error = Some((id.clone(), message.clone()));
+                }
                 self.finish_load_scope(&scope);
                 self.set_error(message);
             }
@@ -237,6 +428,14 @@ impl App {
             Action::SetFocus(pane) => self.focus = pane,
             Action::MoveUp => self.move_selection(-1),
             Action::MoveDown => self.move_selection(1),
+            Action::ScrollUp(n) if self.digest.visible => {
+                self.digest
+                    .move_selection(-isize::try_from(n).unwrap_or(isize::MAX));
+            }
+            Action::ScrollDown(n) if self.digest.visible => {
+                self.digest
+                    .move_selection(isize::try_from(n).unwrap_or(isize::MAX));
+            }
             Action::ScrollUp(n) => {
                 self.at_bottom = false;
                 self.message_scroll_offset = self.message_scroll_offset.saturating_sub(n);
@@ -256,6 +455,7 @@ impl App {
             Action::CloseSelectedDirectMessage => return self.close_selected_direct_message(),
             Action::RefreshNow => return self.refresh_now(),
             Action::OpenSelected => return self.open_selected(),
+            Action::OpenChannel(channel_id) => return self.request_open_channel(channel_id),
             Action::EnterInsert | Action::StartQuickReplyFromSummary => {
                 self.input_mode = InputMode::Insert;
                 self.focus = FocusPane::Input;
@@ -265,11 +465,21 @@ impl App {
                 self.focus = FocusPane::Messages;
             }
             Action::ToggleHelp => self.show_help = !self.show_help,
+            Action::ShowMessages if self.digest.visible => self.digest.visible = false,
             Action::ShowMessages | Action::JumpToTodoMessage => {
                 self.message_pane_view = MessagePaneView::Messages;
             }
             Action::ShowSummary => self.message_pane_view = MessagePaneView::Summary,
             Action::RequestSummary => return self.handle_request_summary(),
+            Action::RegenerateDigest => return self.request_digest(),
+            Action::DigestReady { job, report } => {
+                if self.digest.job == Some(job) {
+                    self.digest.job = None;
+                    self.digest.list =
+                        ListState::default().with_selected(report.rows().next().map(|_| 0));
+                    self.digest.report = Some(report);
+                }
+            }
             Action::SummarySelectNextTodo => self.summary_select_next(),
             Action::SummarySelectPrevTodo => self.summary_select_prev(),
             Action::SendCurrentMessage => return self.handle_send(),
@@ -282,7 +492,24 @@ impl App {
                 self.connection_state = ConnectionState::Connected;
                 self.current_username = username;
             }
+            Action::TransportSessionExpired => {
+                self.finish_load_scope(&LoadScope::StartupConnect);
+                self.finish_load_scope(&LoadScope::GuildBootstrap);
+                #[cfg(feature = "experimental-discord")]
+                {
+                    self.set_browser_phase(BrowserPhase::Ready);
+                    self.set_sign_in_error(
+                        "Message session expired. Sign in again to continue.".into(),
+                    );
+                }
+                self.connection_state = ConnectionState::SessionExpired;
+                self.set_error("Message session expired. Sign in again to continue.".into());
+            }
             Action::TransportDisconnected(reason) => {
+                if let Some(scope) = self.digest.waiting_for_channels.take() {
+                    self.finish_load_scope(&scope);
+                }
+
                 self.finish_load_scope(&LoadScope::StartupConnect);
                 self.finish_load_scope(&LoadScope::GuildBootstrap);
                 self.connection_state = ConnectionState::Disconnected;
@@ -387,6 +614,17 @@ impl App {
             .map(|g| g.name.as_str())
     }
 
+    pub fn selected_history_status(&self) -> Option<&str> {
+        let id = self.selected_channel_id.as_ref()?;
+        if self.active_loads.contains(&LoadScope::History(id.clone())) {
+            return Some("Loading messages…");
+        }
+        self.history_error
+            .as_ref()
+            .filter(|(channel, _)| channel == id)
+            .map(|(_, message)| message.as_str())
+    }
+
     pub fn status_error(&self) -> Option<&str> {
         self.status_error.as_ref().map(|(msg, _)| msg.as_str())
     }
@@ -427,97 +665,246 @@ impl App {
             .then(|| ghostty_progress_bar(self.tick_count))
     }
 
-    pub fn messages_pane_loading(&self) -> bool {
-        let Some(channel_id) = self.selected_channel_id.as_deref() else {
-            return false;
-        };
-        matches!(
-            self.prioritized_load_scope(),
-            Some(LoadScope::History(active_channel_id)) if active_channel_id == channel_id
-        )
-    }
-
-    pub fn messages_pane_loading_bar(&self) -> Option<String> {
-        self.messages_pane_loading()
-            .then(|| ghostty_progress_bar(self.tick_count))
-    }
-
     pub fn unread_divider_message_id(&self) -> Option<&str> {
         self.unread_divider_message_id.as_deref()
     }
 
-    pub fn discord_token_prompt(&self) -> Option<&DiscordTokenPromptState> {
-        self.discord_token_prompt.as_ref()
+    pub fn sign_in(&self) -> Option<&SignInState> {
+        self.sign_in.as_ref()
     }
 
-    pub fn has_discord_token_prompt(&self) -> bool {
-        self.discord_token_prompt.is_some()
+    pub fn has_sign_in(&self) -> bool {
+        self.sign_in.is_some()
     }
 
-    pub fn show_discord_token_prompt(&mut self) {
-        self.discord_token_prompt = Some(DiscordTokenPromptState::default());
+    /// Whether typed characters belong to the token field.
+    #[cfg_attr(
+        all(not(feature = "experimental-discord"), not(test)),
+        expect(dead_code, reason = "the sign-in prompt only opens in Discord builds")
+    )]
+    pub fn sign_in_takes_text(&self) -> bool {
+        match self.sign_in.as_ref().map(|sign_in| &sign_in.mode) {
+            Some(SignInMode::Token { .. }) => true,
+            Some(SignInMode::Browser(_) | SignInMode::Web(_)) | None => false,
+        }
+    }
+
+    /// The signed-in account screen's server list, and the prompt's error line.
+    fn signed_in_account(&mut self) -> Option<(&mut BrowserAccount, &mut Option<String>)> {
+        let SignInState {
+            mode: SignInMode::Browser(BrowserPhase::SignedIn(account)),
+            error,
+        } = self.sign_in.as_mut()?
+        else {
+            return None;
+        };
+        Some((account, error))
+    }
+
+    fn move_account_selection(&mut self, delta: i32) {
+        let Some((account, error)) = self.signed_in_account() else {
+            return;
+        };
+        move_list_selection(&mut account.selection, account.guilds.len(), delta);
+        *error = None;
+    }
+
+    /// Say why a server on the account screen cannot be opened.
+    fn explain_account_guild(&mut self) {
+        let Some((account, error)) = self.signed_in_account() else {
+            return;
+        };
+        let Some(guild) = account
+            .selection
+            .selected()
+            .and_then(|index| account.guilds.get(index))
+        else {
+            return;
+        };
+        *error = Some(format!(
+            "A message token is required to open channels in {}.",
+            guild.name
+        ));
+    }
+
+    /// Open the sign-in prompt on its first screen.
+    #[cfg_attr(
+        all(not(feature = "experimental-discord"), not(test)),
+        expect(dead_code, reason = "the sign-in prompt only opens in Discord builds")
+    )]
+    pub fn show_sign_in(&mut self) {
+        self.sign_in = Some(SignInState {
+            mode: SignInMode::Browser(BrowserPhase::Ready),
+            error: None,
+        });
         self.input_mode = InputMode::Normal;
         self.show_help = false;
+        if let Some(scope) = self.digest.waiting_for_channels.take() {
+            self.finish_load_scope(&scope);
+        }
+        self.digest = DigestPaneState::default();
         self.connection_state = ConnectionState::Disconnected;
     }
 
-    #[cfg_attr(
-        not(feature = "experimental-discord"),
-        expect(
-            dead_code,
-            reason = "startup token prompt is only compiled into Discord builds"
-        )
-    )]
-    pub fn dismiss_discord_token_prompt(&mut self) {
-        self.discord_token_prompt = None;
+    #[cfg(feature = "experimental-discord")]
+    pub fn set_browser_phase(&mut self, phase: BrowserPhase) {
+        if self.sign_in.is_none() {
+            self.show_sign_in();
+        }
+        if let Some(prompt) = self.sign_in.as_mut() {
+            prompt.mode = SignInMode::Browser(phase);
+            prompt.error = None;
+        }
     }
 
-    pub fn push_discord_token_prompt_char(&mut self, ch: char) {
-        let Some(prompt) = self.discord_token_prompt.as_mut() else {
+    pub fn browser_phase(&self) -> Option<&BrowserPhase> {
+        let SignInMode::Browser(phase) = &self.sign_in.as_ref()?.mode else {
+            return None;
+        };
+        Some(phase)
+    }
+
+    pub fn browser_account(&self) -> Option<&str> {
+        match self.browser_phase()? {
+            BrowserPhase::SignedIn(name) | BrowserPhase::SigningOut(name) => Some(&name.name),
+            BrowserPhase::Restore
+            | BrowserPhase::Waiting
+            | BrowserPhase::Ready
+            | BrowserPhase::AccountReady => None,
+        }
+    }
+
+    pub fn account_rail(&mut self) -> Option<(&mut BrowserAccount, &mut AvatarStore)> {
+        let SignInMode::Browser(
+            BrowserPhase::SignedIn(account) | BrowserPhase::SigningOut(account),
+        ) = &mut self.sign_in.as_mut()?.mode
+        else {
+            return None;
+        };
+        Some((account, &mut self.avatars))
+    }
+
+    #[cfg(feature = "experimental-discord")]
+    pub fn show_browser_account(&mut self, name: String, guilds: Vec<GuildSummary>) -> Vec<Effect> {
+        let effects = self.request_avatar_effects(
+            guilds
+                .iter()
+                .filter_map(|guild| guild.avatar_url.as_deref()),
+        );
+        self.set_browser_phase(BrowserPhase::SignedIn(BrowserAccount::new(name, guilds)));
+        effects
+    }
+
+    /// Switch the prompt to Discord's own sign-in window, opening it if the
+    /// prompt was closed.
+    #[cfg(feature = "experimental-discord")]
+    pub fn show_web_sign_in(&mut self) {
+        self.sign_in = Some(SignInState {
+            mode: SignInMode::Web(WebStage::Starting),
+            error: None,
+        });
+    }
+
+    /// Report how far the sign-in window has got, while it is still the prompt.
+    #[cfg(feature = "experimental-discord")]
+    pub fn set_web_stage(&mut self, stage: WebStage) {
+        let Some(SignInState {
+            mode: SignInMode::Web(current),
+            ..
+        }) = self.sign_in.as_mut()
+        else {
             return;
         };
-        prompt.input.push(ch);
-        prompt.error = None;
+        *current = stage;
+    }
+
+    /// Whether the sign-in window is the prompt right now.
+    #[cfg(feature = "experimental-discord")]
+    pub fn web_sign_in_open(&self) -> bool {
+        matches!(
+            self.sign_in.as_ref().map(|sign_in| &sign_in.mode),
+            Some(SignInMode::Web(_))
+        )
+    }
+
+    /// Switch the open prompt to pasting a token.
+    #[cfg_attr(
+        all(not(feature = "experimental-discord"), not(test)),
+        expect(dead_code, reason = "the sign-in prompt only opens in Discord builds")
+    )]
+    pub fn show_token_entry(&mut self) {
+        let Some(sign_in) = self.sign_in.as_mut() else {
+            return;
+        };
+        sign_in.mode = SignInMode::Token {
+            input: String::new(),
+        };
+        sign_in.error = None;
     }
 
     #[cfg_attr(
         not(feature = "experimental-discord"),
-        expect(
-            dead_code,
-            reason = "startup token prompt is only compiled into Discord builds"
-        )
+        expect(dead_code, reason = "the sign-in prompt only opens in Discord builds")
     )]
-    pub fn pop_discord_token_prompt_char(&mut self) {
-        let Some(prompt) = self.discord_token_prompt.as_mut() else {
-            return;
-        };
-        prompt.input.pop();
-        prompt.error = None;
+    pub fn dismiss_sign_in(&mut self) {
+        self.sign_in = None;
     }
 
     #[cfg_attr(
-        not(feature = "experimental-discord"),
-        expect(
-            dead_code,
-            reason = "startup token prompt is only compiled into Discord builds"
-        )
+        all(not(feature = "experimental-discord"), not(test)),
+        expect(dead_code, reason = "the sign-in prompt only opens in Discord builds")
     )]
-    pub fn set_discord_token_prompt_error(&mut self, error: String) {
-        let Some(prompt) = self.discord_token_prompt.as_mut() else {
+    pub fn set_sign_in_error(&mut self, error: String) {
+        let Some(sign_in) = self.sign_in.as_mut() else {
             return;
         };
-        prompt.error = Some(error);
+        sign_in.error = Some(error);
     }
 
-    pub fn take_discord_token_prompt_input(&mut self) -> Option<String> {
-        let prompt = self.discord_token_prompt.as_mut()?;
-        let input = std::mem::take(&mut prompt.input);
+    /// The token field, for editing. Touching it clears the last error.
+    fn token_input_mut(&mut self) -> Option<&mut String> {
+        let sign_in = self.sign_in.as_mut()?;
+        match &mut sign_in.mode {
+            SignInMode::Token { input } => {
+                sign_in.error = None;
+                Some(input)
+            }
+            SignInMode::Browser(_) | SignInMode::Web(_) => None,
+        }
+    }
+
+    #[cfg_attr(
+        all(not(feature = "experimental-discord"), not(test)),
+        expect(dead_code, reason = "the sign-in prompt only opens in Discord builds")
+    )]
+    pub fn push_token_char(&mut self, ch: char) {
+        if let Some(input) = self.token_input_mut() {
+            input.push(ch);
+        }
+    }
+
+    #[cfg_attr(
+        all(not(feature = "experimental-discord"), not(test)),
+        expect(dead_code, reason = "the sign-in prompt only opens in Discord builds")
+    )]
+    pub fn pop_token_char(&mut self) {
+        if let Some(input) = self.token_input_mut() {
+            input.pop();
+        }
+    }
+
+    /// Take the pasted token out of the field, or flag the field as empty.
+    #[cfg_attr(
+        all(not(feature = "experimental-discord"), not(test)),
+        expect(dead_code, reason = "the sign-in prompt only opens in Discord builds")
+    )]
+    pub fn take_token_input(&mut self) -> Option<String> {
+        let input = std::mem::take(self.token_input_mut()?);
         let trimmed = input.trim().to_string();
         if trimmed.is_empty() {
-            prompt.error = Some("Discord token is required".into());
+            self.set_sign_in_error("Discord token is required".into());
             return None;
         }
-        prompt.error = None;
         Some(trimmed)
     }
 
@@ -545,14 +932,19 @@ impl App {
         self.closed_direct_messages = store.closed_direct_messages();
     }
 
+    pub fn is_closed_direct_message(&self, channel: &ChannelSummary) -> bool {
+        Self::dm_is_closed(channel, &self.closed_direct_messages)
+    }
+
+    fn dm_is_closed(channel: &ChannelSummary, closed: &HashSet<String>) -> bool {
+        channel.kind == ChannelKind::DirectMessage && closed.contains(&channel.id)
+    }
+
     fn filter_closed_direct_messages(
         channels: &mut Vec<ChannelSummary>,
         closed_direct_messages: &HashSet<String>,
     ) {
-        channels.retain(|channel| {
-            channel.kind != ChannelKind::DirectMessage
-                || !closed_direct_messages.contains(&channel.id)
-        });
+        channels.retain(|channel| !Self::dm_is_closed(channel, closed_direct_messages));
     }
 
     fn reopen_direct_message(&mut self, channel_id: &str) -> bool {
@@ -1077,7 +1469,31 @@ impl App {
             self.status_error = None;
         }
 
-        self.tick_count += 1;
+        self.tick_count = self.tick_count.wrapping_add(1);
+        if self.has_sign_in() {
+            return Vec::new();
+        }
+        let mut effects = self.advance_pending_open(true);
+        let channels_ready = self
+            .digest
+            .waiting_for_channels
+            .as_ref()
+            .is_some_and(|scope| match scope {
+                LoadScope::GuildBootstrap => {
+                    self.can_search_for_channel() && !self.guilds.is_empty()
+                }
+                LoadScope::ChannelList(id) => {
+                    self.has_channel_list(id) || !self.guilds.iter().any(|g| &g.id == id)
+                }
+                _ => false,
+            });
+        if channels_ready {
+            self.digest.waiting_for_channels = None;
+            effects.extend(self.request_digest());
+        }
+        if !effects.is_empty() {
+            return effects;
+        }
         // Live Discord already receives gateway updates; periodic REST refreshes can still race
         // with fresher gateway-delivered state, so keep auto-refresh scoped to the mock transport.
         if self.connection_state == ConnectionState::MockTransport
@@ -1095,6 +1511,7 @@ impl App {
             let message = match self.connection_state {
                 ConnectionState::Connecting | ConnectionState::Reconnecting => "Still connecting",
                 ConnectionState::Disconnected => "Connect first to refresh",
+                ConnectionState::SessionExpired => "Sign in again to refresh messages",
                 ConnectionState::Connected | ConnectionState::MockTransport => {
                     if self.selected_guild_id.is_none() && self.selected_channel_id.is_none() {
                         "Select a guild or channel to refresh"
@@ -1111,7 +1528,10 @@ impl App {
     fn refresh_effects(&self) -> Vec<Effect> {
         if matches!(
             self.connection_state,
-            ConnectionState::Connecting | ConnectionState::Disconnected
+            ConnectionState::Connecting
+                | ConnectionState::Reconnecting
+                | ConnectionState::Disconnected
+                | ConnectionState::SessionExpired
         ) {
             return Vec::new();
         }
@@ -1278,6 +1698,7 @@ impl App {
         );
         self.guilds = guilds;
         self.guild_channels = channels;
+        self.partial_channel_lists.clear();
         // Override gateway unread state with our local DB read positions
         self.apply_local_read_state();
         if !self.guilds.is_empty() && self.guild_state.selected().is_none() {
@@ -1301,6 +1722,7 @@ impl App {
         self.prepare_loaded_channels(&guild.id, &mut channels);
         let effects = self.request_avatar_effects(guild.avatar_url.as_deref());
         // Store channels for this guild
+        self.partial_channel_lists.remove(&guild.id);
         self.guild_channels.insert(guild.id.clone(), channels);
 
         // Add guild if not already present
@@ -1359,6 +1781,7 @@ impl App {
 
         // Persist into the per-guild cache so restore_session and unread tracking work
         if let Some(gid) = guild_id {
+            self.partial_channel_lists.remove(gid);
             self.prepare_loaded_channels(gid, &mut channels);
             self.merge_refreshed_channels(&mut channels, previous_channels.as_deref());
             self.guild_channels
@@ -1565,7 +1988,13 @@ impl App {
             );
             mark_channel_unread(&mut hinted_channel, &msg_id);
             affected_guild_id = Some(guild_id.clone());
-            let cached_channels = self.guild_channels.entry(guild_id.clone()).or_default();
+            let cached_channels =
+                self.guild_channels
+                    .entry(guild_id.clone())
+                    .or_insert_with(|| {
+                        self.partial_channel_lists.insert(guild_id.clone());
+                        Vec::new()
+                    });
             if !cached_channels
                 .iter()
                 .any(|channel| channel.id == hinted_channel.id)
@@ -1641,8 +2070,25 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: i32) {
+        if self.digest.visible {
+            self.digest.move_selection(if delta < 0 { -1 } else { 1 });
+            return;
+        }
+
         match self.focus {
             FocusPane::Guilds => {
+                if self.digest.rail_selected {
+                    if delta > 0 && !self.guilds.is_empty() {
+                        self.digest.rail_selected = false;
+                        self.guild_state.select(Some(0));
+                        self.sync_guild_list_offset();
+                    }
+                    return;
+                }
+                if delta < 0 && self.guild_state.selected().unwrap_or_default() == 0 {
+                    self.digest.rail_selected = true;
+                    return;
+                }
                 move_list_selection(&mut self.guild_state, self.guilds.len(), delta);
                 self.sync_guild_list_offset();
             }
@@ -1675,10 +2121,17 @@ impl App {
     }
 
     fn jump_to_boundary(&mut self, to_top: bool) {
+        if self.digest.visible {
+            self.digest
+                .move_selection(if to_top { isize::MIN } else { isize::MAX });
+            return;
+        }
+
         match self.focus {
+            FocusPane::Guilds if to_top => self.digest.rail_selected = true,
             FocusPane::Guilds if !self.guilds.is_empty() => {
-                let idx = if to_top { 0 } else { self.guilds.len() - 1 };
-                self.guild_state.select(Some(idx));
+                self.digest.rail_selected = false;
+                self.guild_state.select(self.guilds.len().checked_sub(1));
                 self.sync_guild_list_offset();
             }
             FocusPane::Channels if !self.channels.is_empty() => {
@@ -1701,7 +2154,27 @@ impl App {
     }
 
     fn open_selected(&mut self) -> Vec<Effect> {
+        if self.digest.visible {
+            let channel_id = self.digest.list.selected().and_then(|index| {
+                self.digest
+                    .report
+                    .as_ref()?
+                    .rows()
+                    .nth(index)?
+                    .channel_id()
+                    .map(str::to_string)
+            });
+            return channel_id.map_or_else(Vec::new, |id| self.request_open_channel(id));
+        }
+
         match self.focus {
+            FocusPane::Guilds if self.digest.rail_selected => {
+                self.digest.visible = true;
+                if self.digest.report.is_none() {
+                    return self.request_digest();
+                }
+                Vec::new()
+            }
             FocusPane::Guilds => self.select_guild(),
             FocusPane::Channels => self.select_channel(),
             FocusPane::Messages => {
@@ -1710,6 +2183,221 @@ impl App {
             }
             FocusPane::Input => Vec::new(),
         }
+    }
+
+    fn has_channel_list(&self, guild_id: &str) -> bool {
+        self.guild_channels.contains_key(guild_id) && !self.partial_channel_lists.contains(guild_id)
+    }
+
+    fn request_digest(&mut self) -> Vec<Effect> {
+        if !self.digest.visible
+            || self.digest.job.is_some()
+            || self.digest.waiting_for_channels.is_some()
+        {
+            return Vec::new();
+        }
+        let sample = self.connection_state == ConnectionState::MockTransport;
+        if !matches!(
+            self.connection_state,
+            ConnectionState::MockTransport
+                | ConnectionState::Connected
+                | ConnectionState::Connecting
+                | ConnectionState::Reconnecting
+        ) {
+            self.set_error("Connect to Discord, then press S to generate a digest".into());
+            return Vec::new();
+        }
+        if self.guilds.is_empty() || !self.can_search_for_channel() {
+            self.digest.waiting_for_channels = Some(LoadScope::GuildBootstrap);
+            return Vec::new();
+        }
+        if !sample && let Some(guild) = self.guilds.iter().find(|g| !self.has_channel_list(&g.id)) {
+            let guild_id = guild.id.clone();
+            let scope = LoadScope::ChannelList(guild_id.clone());
+            self.digest.waiting_for_channels = Some(scope.clone());
+            return if self.active_loads.insert(scope) {
+                vec![Effect::LoadChannels { guild_id }]
+            } else {
+                Vec::new()
+            };
+        }
+        let sample_channels;
+        let (channels, user_name, include) = if sample {
+            sample_channels = self
+                .guilds
+                .iter()
+                .map(|guild| {
+                    let channels = self
+                        .guild_channels
+                        .get(&guild.id)
+                        .cloned()
+                        .unwrap_or_else(|| crate::transport::mock::channels(&guild.id));
+                    (guild.id.clone(), channels)
+                })
+                .collect();
+            (
+                &sample_channels,
+                crate::transport::mock::USER_NAME.to_string(),
+                Vec::new(),
+            )
+        } else {
+            (
+                &self.guild_channels,
+                self.current_username.clone(),
+                self.digest_include.clone(),
+            )
+        };
+        let options = DigestOptions {
+            include,
+            ..DigestOptions::default()
+        };
+        let request = PreparedDigest::new(&self.guilds, channels, &options, user_name);
+        let job = Instant::now();
+        self.digest.job = Some(job);
+        vec![Effect::GenerateDigest { job, request }]
+    }
+
+    /// What the terminal should know about this session (OSC 7501).
+    pub fn program_status(&self) -> Report {
+        match self.sign_in.as_ref().map(|sign_in| &sign_in.mode) {
+            Some(SignInMode::Browser(phase)) => {
+                return match phase {
+                    BrowserPhase::SignedIn(_) => {
+                        Report::new(State::Idle, "Discord account verified")
+                    }
+                    BrowserPhase::Restore | BrowserPhase::SigningOut(_) => {
+                        Report::new(State::Working, "Updating Discord account")
+                    }
+                    BrowserPhase::Ready | BrowserPhase::AccountReady => {
+                        Report::new(State::BlockedOnAuth, "Connect with Discord")
+                    }
+                    BrowserPhase::Waiting => {
+                        Report::new(State::BlockedOnAuth, "Approve in your browser")
+                    }
+                };
+            }
+            Some(SignInMode::Web(stage)) => {
+                return Report::new(State::Working, stage.label());
+            }
+            Some(SignInMode::Token { .. }) => {
+                return Report::new(State::BlockedOnAuth, "Discord token needed");
+            }
+            None => {}
+        }
+        if self.digest.waiting_for_channels.is_some() && self.digest.visible {
+            return Report::new(State::Working, "Loading channels for digest");
+        }
+        if self.digest.job.is_some() {
+            return Report::new(State::Working, "Generating digest");
+        }
+        if self.summary_state.in_flight {
+            return Report::new(State::Working, "Summarizing");
+        }
+        match self.connection_state {
+            ConnectionState::Connecting | ConnectionState::Reconnecting => {
+                Report::new(State::Working, "Connecting to Discord")
+            }
+            ConnectionState::SessionExpired => {
+                Report::new(State::BlockedOnAuth, "Message session expired")
+            }
+            ConnectionState::Connected
+            | ConnectionState::Disconnected
+            | ConnectionState::MockTransport => Report::new(State::Idle, ""),
+        }
+    }
+
+    /// Every known channel, keyed by server id.
+    pub fn guild_channels(&self) -> &HashMap<String, Vec<ChannelSummary>> {
+        &self.guild_channels
+    }
+
+    /// Open a channel by id, from `--open` or the control socket. If its server has
+    /// not loaded yet, keep the request and retry on later ticks.
+    fn request_open_channel(&mut self, channel_id: String) -> Vec<Effect> {
+        self.pending_open_channel = Some(PendingOpen {
+            channel_id,
+            ticks_waited: 0,
+            requested_guilds: HashSet::new(),
+        });
+        self.advance_pending_open(false)
+    }
+
+    fn can_search_for_channel(&self) -> bool {
+        !self.has_sign_in()
+            && matches!(
+                self.connection_state,
+                ConnectionState::Connected | ConnectionState::MockTransport
+            )
+            && !self.active_loads.contains(&LoadScope::GuildBootstrap)
+    }
+
+    /// The channel may live in a server whose channel list has not been fetched,
+    /// so request each such list once.
+    fn load_unfetched_guilds(&self, pending: &mut PendingOpen) -> Vec<Effect> {
+        let mut effects = Vec::new();
+        for guild in &self.guilds {
+            if self.guild_channels.contains_key(&guild.id) {
+                continue;
+            }
+            if pending.requested_guilds.insert(guild.id.clone()) {
+                effects.push(Effect::LoadChannels {
+                    guild_id: guild.id.clone(),
+                });
+            }
+        }
+        effects
+    }
+
+    fn advance_pending_open(&mut self, tick: bool) -> Vec<Effect> {
+        if !self.can_search_for_channel() {
+            return Vec::new();
+        }
+        let Some(mut pending) = self.pending_open_channel.take() else {
+            return Vec::new();
+        };
+        if let Some(effects) = self.open_channel_by_id(&pending.channel_id) {
+            return effects;
+        }
+        if pending.ticks_waited >= PENDING_OPEN_MAX_TICKS {
+            self.set_error(format!("Channel {} was not found", pending.channel_id));
+            return Vec::new();
+        }
+        pending.ticks_waited += u32::from(tick);
+        let effects = self.load_unfetched_guilds(&mut pending);
+        self.pending_open_channel = Some(pending);
+        effects
+    }
+
+    /// Select the server that owns `channel_id`, then the channel. `None` when no
+    /// loaded server has that channel.
+    fn open_channel_by_id(&mut self, channel_id: &str) -> Option<Vec<Effect>> {
+        let guild_id = self
+            .guild_channels
+            .iter()
+            .find(|(_, channels)| {
+                channels
+                    .iter()
+                    .any(|channel| channel.id == channel_id && channel.kind.is_selectable())
+            })
+            .map(|(guild_id, _)| guild_id.clone())?;
+        let guild_index = self.guilds.iter().position(|guild| guild.id == guild_id)?;
+
+        self.guild_state.select(Some(guild_index));
+        let mut effects = self.select_guild();
+        let Some(channel_index) = self
+            .channels
+            .iter()
+            .position(|channel| channel.id == channel_id)
+        else {
+            self.set_error("That channel is hidden; reopen it from the sidebar".into());
+            return Some(effects);
+        };
+        self.channel_state.select(Some(channel_index));
+        self.session_restore_pending = false;
+        self.digest.visible = false;
+        self.digest.rail_selected = false;
+        effects.extend(self.select_channel());
+        Some(effects)
     }
 
     /// If in summary view with a selected TODO, switch to messages view.
@@ -1975,7 +2663,7 @@ fn mark_channel_unread(channel: &mut ChannelSummary, message_id: &str) {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "unwrap is fine in tests")]
 mod tests {
-    use super::*;
+    use crate::app::*;
     use crate::model::{ChannelKind, DIRECT_MESSAGES_GUILD_ID};
     use crate::transport::mock;
 
@@ -2208,11 +2896,38 @@ mod tests {
     }
 
     #[test]
-    fn discord_token_prompt_is_modal_and_sets_disconnected_state() {
-        let mut app = app_with_guilds();
-        app.show_discord_token_prompt();
+    fn data_that_arrives_while_help_is_open_is_kept() {
+        let mut app = App::new();
+        app.update(Action::ToggleHelp);
 
-        assert!(app.has_discord_token_prompt());
+        app.update(Action::GuildsLoaded(mock::guilds()));
+        app.update(Action::ChannelsLoaded {
+            guild_id: Some("g3".into()),
+            channels: mock::channels("g3"),
+        });
+        let effects = app.update(Action::OpenChannel("c20".into()));
+        assert!(app.show_help);
+        assert_eq!(app.selected_channel_id.as_deref(), Some("c20"));
+        assert!(effects.iter().any(
+            |effect| matches!(effect, Effect::LoadHistory { channel_id } if channel_id == "c20")
+        ));
+
+        app.update(Action::HistoryLoaded {
+            channel_id: "c20".into(),
+            messages: mock::messages("c20"),
+            has_more: false,
+        });
+        assert_eq!(app.messages.len(), mock::messages("c20").len());
+        assert!(!app.messages.is_empty());
+    }
+
+    #[test]
+    fn sign_in_is_modal_and_sets_disconnected_state() {
+        let mut app = app_with_guilds();
+        app.show_sign_in();
+
+        assert!(app.has_sign_in());
+        assert!(!app.sign_in_takes_text());
         assert_eq!(app.connection_state, ConnectionState::Disconnected);
 
         let focus_before = app.focus;
@@ -2221,26 +2936,124 @@ mod tests {
     }
 
     #[test]
-    fn discord_token_prompt_requires_non_empty_token() {
-        let mut app = App::new();
-        app.show_discord_token_prompt();
-
-        assert!(app.take_discord_token_prompt_input().is_none());
+    fn stage_words_from_the_sign_in_window_map_to_what_the_user_sees() {
+        assert_eq!(WebStage::parse("waiting"), Some(WebStage::Waiting));
+        assert_eq!(WebStage::parse("verifying"), Some(WebStage::Verifying));
+        // A rejected check is still the verifying step; the error says the rest.
+        assert_eq!(WebStage::parse("rejected"), Some(WebStage::Verifying));
+        assert_eq!(WebStage::parse("ready"), Some(WebStage::Connecting));
+        assert_eq!(WebStage::parse("saved"), Some(WebStage::Connecting));
+        assert_eq!(WebStage::parse("something-newer"), None);
+        assert_eq!(WebStage::Waiting.label(), "Waiting for Discord");
         assert_eq!(
-            app.discord_token_prompt()
-                .and_then(|prompt| prompt.error.as_deref()),
+            WebStage::Starting.label(),
+            "Opening Discord's sign-in window"
+        );
+    }
+
+    #[cfg(feature = "experimental-discord")]
+    #[test]
+    fn the_sign_in_window_opens_the_prompt_and_reports_its_progress() {
+        let mut app = App::new();
+        app.show_web_sign_in();
+        assert!(app.web_sign_in_open());
+        assert_eq!(
+            app.sign_in().map(|prompt| &prompt.mode),
+            Some(&SignInMode::Web(WebStage::Starting))
+        );
+
+        app.set_web_stage(WebStage::Waiting);
+        assert_eq!(
+            app.sign_in().map(|prompt| &prompt.mode),
+            Some(&SignInMode::Web(WebStage::Waiting))
+        );
+
+        // Progress from a window the user already left behind is ignored.
+        app.show_token_entry();
+        app.set_web_stage(WebStage::Connecting);
+        assert!(!app.web_sign_in_open());
+        assert!(app.sign_in_takes_text());
+    }
+
+    #[test]
+    fn sign_in_prompt_keeps_the_configured_digest_whitelist() {
+        let mut app = App::new();
+        app.digest_include = Include::parse("Rust Lang").into_iter().collect();
+        app.digest.visible = true;
+
+        app.show_sign_in();
+
+        assert!(!app.digest.visible);
+        assert_eq!(
+            app.digest_include,
+            Include::parse("Rust Lang").into_iter().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn showing_sign_in_again_returns_to_the_first_screen() {
+        let mut app = App::new();
+        app.show_sign_in();
+        app.show_token_entry();
+        app.set_sign_in_error("Failed to connect".into());
+
+        app.show_sign_in();
+        assert_eq!(app.browser_phase(), Some(&BrowserPhase::Ready));
+        assert_eq!(
+            app.sign_in().and_then(|sign_in| sign_in.error.as_deref()),
+            None
+        );
+    }
+
+    #[test]
+    fn token_entry_requires_non_empty_token() {
+        let mut app = App::new();
+        app.show_sign_in();
+        app.show_token_entry();
+        assert!(app.sign_in_takes_text());
+
+        assert!(app.take_token_input().is_none());
+        assert_eq!(
+            app.sign_in().and_then(|sign_in| sign_in.error.as_deref()),
             Some("Discord token is required")
         );
 
-        app.push_discord_token_prompt_char(' ');
-        app.push_discord_token_prompt_char('a');
-        app.push_discord_token_prompt_char('b');
-        app.push_discord_token_prompt_char('c');
-        app.push_discord_token_prompt_char(' ');
-
+        for ch in [' ', 'a', 'b', 'c', ' '] {
+            app.push_token_char(ch);
+        }
+        app.pop_token_char();
+        app.pop_token_char();
+        app.push_token_char('d');
         assert_eq!(
-            app.take_discord_token_prompt_input().as_deref(),
-            Some("abc")
+            app.sign_in().and_then(|sign_in| sign_in.error.as_deref()),
+            None,
+            "typing clears the error"
+        );
+
+        assert_eq!(app.take_token_input().as_deref(), Some("abd"));
+    }
+
+    #[test]
+    fn typed_characters_do_not_reach_the_first_screen() {
+        let mut app = App::new();
+        app.show_sign_in();
+        app.push_token_char('x');
+        assert_eq!(app.browser_phase(), Some(&BrowserPhase::Ready));
+        assert!(app.take_token_input().is_none());
+    }
+
+    #[test]
+    fn program_status_names_the_sign_in_step() {
+        let mut app = App::new();
+        app.show_sign_in();
+        assert_eq!(
+            app.program_status(),
+            Report::new(State::BlockedOnAuth, "Connect with Discord")
+        );
+        app.show_token_entry();
+        assert_eq!(
+            app.program_status(),
+            Report::new(State::BlockedOnAuth, "Discord token needed")
         );
     }
 
@@ -2455,7 +3268,6 @@ mod tests {
         app.start_load_scope(LoadScope::History("c1".into()));
 
         assert_eq!(app.active_load_label(), Some("Refreshing history"));
-        assert!(app.messages_pane_loading());
         assert!(!app.channels_pane_loading());
     }
 
@@ -2579,6 +3391,106 @@ mod tests {
         );
     }
 
+    fn app_with_all_mock_channels() -> App {
+        let mut app = app_with_guilds();
+        for guild_id in ["g1", "g2", "g3", "g4"] {
+            app.update(Action::ChannelsLoaded {
+                guild_id: Some(guild_id.into()),
+                channels: crate::transport::mock::channels(guild_id),
+            });
+        }
+        app
+    }
+
+    #[test]
+    fn open_channel_by_id_switches_server_and_loads_history() {
+        let mut app = app_with_all_mock_channels();
+
+        let effects = app.update(Action::OpenChannel("c20".into()));
+
+        assert_eq!(app.selected_guild_id.as_deref(), Some("g3"));
+        assert_eq!(app.selected_channel_id.as_deref(), Some("c20"));
+        assert_eq!(app.focus, FocusPane::Messages);
+        assert!(effects.iter().any(
+            |effect| matches!(effect, Effect::LoadHistory { channel_id } if channel_id == "c20")
+        ));
+    }
+
+    #[test]
+    fn open_channel_before_its_server_loads_waits_then_opens() {
+        let mut app = app_with_guilds();
+
+        let effects = app.update(Action::OpenChannel("c20".into()));
+        let requested: Vec<&str> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::LoadChannels { guild_id } => Some(guild_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(requested.contains(&"g3"), "should fetch unloaded servers");
+        assert_eq!(app.selected_channel_id, None);
+
+        app.update(Action::ChannelsLoaded {
+            guild_id: Some("g3".into()),
+            channels: crate::transport::mock::channels("g3"),
+        });
+        let effects = app.update(Action::Tick);
+
+        assert_eq!(app.selected_channel_id.as_deref(), Some("c20"));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::LoadHistory { .. }))
+        );
+    }
+
+    #[test]
+    fn open_requested_before_servers_arrive_fetches_them_once() {
+        let mut app = App::new();
+        assert!(app.update(Action::OpenChannel("c20".into())).is_empty());
+
+        app.update(Action::GuildsLoaded(mock::guilds()));
+        let first = app.update(Action::Tick);
+        let load_count = |effects: &[Effect]| {
+            effects
+                .iter()
+                .filter(|effect| matches!(effect, Effect::LoadChannels { .. }))
+                .count()
+        };
+        assert_eq!(load_count(&first), 5, "four servers plus direct messages");
+
+        let second = app.update(Action::Tick);
+        assert_eq!(load_count(&second), 0, "each server is requested once");
+
+        app.update(Action::ChannelsLoaded {
+            guild_id: Some("g3".into()),
+            channels: crate::transport::mock::channels("g3"),
+        });
+        app.update(Action::Tick);
+        assert_eq!(app.selected_channel_id.as_deref(), Some("c20"));
+    }
+
+    #[test]
+    fn open_unknown_channel_gives_up_with_an_error() {
+        let mut app = app_with_all_mock_channels();
+        app.update(Action::OpenChannel("nope".into()));
+
+        for _ in 0..=PENDING_OPEN_MAX_TICKS {
+            app.update(Action::Tick);
+        }
+
+        assert_eq!(app.status_error(), Some("Channel nope was not found"));
+        assert_eq!(app.selected_channel_id, None);
+    }
+
+    #[test]
+    fn open_channel_ignores_categories() {
+        let mut app = app_with_all_mock_channels();
+        app.update(Action::OpenChannel("cat1".into()));
+        assert_eq!(app.selected_channel_id, None);
+    }
+
     #[test]
     fn open_channel_emits_load_history_effect() {
         let app = app_in_channel();
@@ -2657,7 +3569,7 @@ mod tests {
         assert_eq!(app.messages.len(), msg_count + 1);
         assert_eq!(app.messages.last().unwrap().author, "you");
         assert_eq!(app.messages.last().unwrap().content, "Hello world!");
-        assert!(app.input_text.is_empty());
+        assert_eq!(app.input_text, "");
         assert_eq!(effects.len(), 1);
         assert!(matches!(effects[0], Effect::SendMessage { .. }));
     }
@@ -2960,6 +3872,7 @@ mod tests {
         // Stale summary arrives for the original channel
         app.update(Action::SummaryReady(ChannelDigest {
             channel_id: original_channel,
+            headline: "stale".into(),
             summary: "stale summary".into(),
             todos: vec![],
             generated_at: "00:00".into(),

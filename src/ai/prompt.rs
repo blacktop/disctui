@@ -17,6 +17,34 @@ pub fn build_system_prompt(channel_name: &str, user_name: &str) -> String {
     )
 }
 
+/// JSON Schema for the digest response, shared by every backend that supports
+/// schema-constrained output.
+pub fn digest_json_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "headline": { "type": "string" },
+            "summary": { "type": "string" },
+            "action_items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "author": { "type": "string" },
+                        "snippet": { "type": "string" },
+                        "reason": { "type": "string" },
+                        "message_id": { "type": "string" }
+                    },
+                    "required": ["author", "snippet", "reason", "message_id"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["headline", "summary", "action_items"],
+        "additionalProperties": false
+    })
+}
+
 pub fn format_messages(messages: &[MessageRow]) -> String {
     let mut lines = Vec::with_capacity(messages.len());
     for msg in messages {
@@ -41,8 +69,14 @@ pub fn parse_digest(text: &str, channel_id: &str) -> Result<ChannelDigest> {
     let raw: RawDigest = serde_json::from_str(json_str)
         .map_err(|e| eyre!("failed to parse digest JSON: {e}\nraw: {text}"))?;
 
+    let headline = match raw.headline.trim() {
+        "" => headline_from_summary(&raw.summary),
+        headline => headline.to_string(),
+    };
+
     Ok(ChannelDigest {
         channel_id: channel_id.into(),
+        headline,
         summary: raw.summary,
         todos: raw
             .action_items
@@ -58,6 +92,16 @@ pub fn parse_digest(text: &str, channel_id: &str) -> Result<ChannelDigest> {
     })
 }
 
+/// Fall back to the first sentence of the summary when a model omits the headline.
+fn headline_from_summary(summary: &str) -> String {
+    let first_line = summary.lines().next().unwrap_or_default();
+    first_line
+        .split_once(". ")
+        .map_or(first_line, |(sentence, _)| sentence)
+        .trim_end_matches('.')
+        .to_string()
+}
+
 /// Extract JSON from text that may be wrapped in markdown code blocks.
 pub fn extract_json(text: &str) -> &str {
     let trimmed = text.trim();
@@ -68,6 +112,7 @@ pub fn extract_json(text: &str) -> &str {
 }
 
 const RESPONSE_SCHEMA: &str = r#"{
+  "headline": "One line, at most 70 characters, naming the main topic",
   "summary": "Brief 2-3 sentence summary of the conversation",
   "action_items": [
     {
@@ -81,6 +126,8 @@ const RESPONSE_SCHEMA: &str = r#"{
 
 #[derive(Deserialize)]
 pub struct RawDigest {
+    #[serde(default, alias = "title")]
+    pub headline: String,
     #[serde(alias = "overview", alias = "description")]
     pub summary: String,
     #[serde(default, alias = "items", alias = "todos", alias = "actions")]
@@ -102,7 +149,7 @@ pub struct RawTodoItem {
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "unwrap is fine in tests")]
 mod tests {
-    use super::*;
+    use crate::ai::prompt::*;
 
     #[test]
     fn parse_valid_digest() {
@@ -111,7 +158,7 @@ mod tests {
             "action_items": [
                 {
                     "author": "dave",
-                    "snippet": "@blacktop thoughts on the new edition?",
+                    "snippet": "@ferris thoughts on the new edition?",
                     "reason": "Direct question to you",
                     "message_id": "m12"
                 }
@@ -140,6 +187,37 @@ mod tests {
         let digest = parse_digest(json, "c1").unwrap();
         assert_eq!(digest.summary, "Quiet channel, nothing notable.");
         assert!(digest.todos.is_empty());
+    }
+
+    #[test]
+    fn headline_is_kept_when_the_model_provides_one() {
+        let json = r#"{"headline": "Edition migration", "summary": "Long text. More."}"#;
+        let digest = parse_digest(json, "c1").unwrap();
+        assert_eq!(digest.headline, "Edition migration");
+    }
+
+    #[test]
+    fn missing_headline_falls_back_to_first_sentence() {
+        let json = r#"{"summary": "Borrow checker news. Then async closures."}"#;
+        let digest = parse_digest(json, "c1").unwrap();
+        assert_eq!(digest.headline, "Borrow checker news");
+    }
+
+    #[test]
+    fn blank_headline_falls_back_to_single_sentence_summary() {
+        let json = r#"{"headline": "  ", "summary": "Quiet channel."}"#;
+        let digest = parse_digest(json, "c1").unwrap();
+        assert_eq!(digest.headline, "Quiet channel");
+    }
+
+    #[test]
+    fn schema_requires_every_top_level_field() {
+        let schema = digest_json_schema();
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["headline", "summary", "action_items"])
+        );
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
     }
 
     #[test]

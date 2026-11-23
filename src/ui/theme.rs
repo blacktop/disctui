@@ -1,82 +1,111 @@
-use ratatui::style::{Color, Modifier, Style};
+//! One place for color and emphasis. Panes are separated by hairlines and
+//! selection fills rather than boxes, so focus reads from the title and the
+//! selected row instead of a border color.
+
+use ratatui::style::{Color, Style};
 
 pub const MUTE_GLYPH: &str = "⊘";
-pub const DISCORD_BLURPLE: Color = Color::Rgb(88, 101, 242);
-pub const DISCORD_BLURPLE_LIGHT: Color = Color::Rgb(121, 134, 255);
-pub const DISCORD_BG_DARK: Color = Color::Rgb(35, 39, 42);
-pub const DISCORD_RED: Color = Color::Rgb(237, 66, 69);
+pub const UNREAD_GLYPH: &str = "●";
 
-// Pane border when focused
-pub fn focused_border() -> Style {
-    Style::new().fg(DISCORD_BLURPLE)
+/// Brand accent: focus, unread markers, counts.
+pub const ACCENT: Color = Color::Rgb(153, 162, 255);
+/// Things addressed to the user: mentions and action items.
+pub const ATTENTION: Color = Color::Rgb(232, 184, 107);
+const DIM: Color = Color::Rgb(142, 147, 168);
+const DANGER: Color = Color::Rgb(242, 139, 141);
+const SUCCESS: Color = Color::Rgb(127, 207, 149);
+/// Background of the top bar and footer.
+const SURFACE: Color = Color::Rgb(26, 28, 36);
+const HAIRLINE: Color = Color::Rgb(58, 62, 78);
+const SELECTION_FOCUSED: Color = Color::Rgb(42, 46, 74);
+const SELECTION: Color = Color::Rgb(34, 36, 46);
+const ON_ACCENT: Color = Color::Rgb(20, 21, 27);
+
+/// Title row of a pane. The focused pane's title carries the accent.
+pub fn pane_title(focused: bool) -> Style {
+    if focused {
+        Style::new().fg(ACCENT).bold()
+    } else {
+        dim()
+    }
 }
 
-// Pane border when not focused
-pub fn unfocused_border() -> Style {
-    Style::new().fg(Color::DarkGray)
+/// Hairline between panes.
+pub fn divider() -> Style {
+    Style::new().fg(HAIRLINE)
 }
 
-// Selected item in a list
+/// Selected row of a list. Brighter in the focused pane.
+pub fn selected_row(focused: bool) -> Style {
+    if focused {
+        Style::new().bg(SELECTION_FOCUSED).bold()
+    } else {
+        Style::new().bg(SELECTION)
+    }
+}
+
+/// Emphasized text inside popups and the summary: keys, selected action items.
 pub fn selected_item() -> Style {
-    Style::new()
-        .fg(DISCORD_BLURPLE_LIGHT)
-        .add_modifier(Modifier::BOLD)
+    Style::new().fg(ACCENT).bold()
 }
 
-pub fn selected_panel_row() -> Style {
-    Style::new()
-        .fg(Color::White)
-        .bg(Color::Rgb(78, 88, 150))
-        .add_modifier(Modifier::BOLD)
-}
-
-pub fn selected_avatar_only_row() -> Style {
-    Style::new().bg(Color::Rgb(67, 76, 130))
-}
-
-// Normal list item
-#[expect(dead_code, reason = "reserved for unselected list items")]
-pub fn normal_item() -> Style {
-    Style::new().fg(Color::Gray)
-}
-
-// Unread indicator
 pub fn unread() -> Style {
-    Style::new()
-        .fg(DISCORD_BLURPLE_LIGHT)
-        .add_modifier(Modifier::BOLD)
+    Style::new().fg(ACCENT).bold()
 }
 
-// Status bar background
-pub fn status_bar() -> Style {
-    Style::new().fg(Color::White).bg(DISCORD_BG_DARK)
+pub fn unread_name() -> Style {
+    Style::new().bold()
 }
 
-pub fn app_badge() -> Style {
-    Style::new()
-        .fg(Color::White)
-        .bg(DISCORD_BLURPLE)
-        .add_modifier(Modifier::BOLD)
+pub fn count() -> Style {
+    Style::new().fg(ACCENT)
+}
+
+pub fn attention() -> Style {
+    Style::new().fg(ATTENTION).bold()
+}
+
+/// Top bar and footer background.
+pub fn bar() -> Style {
+    Style::new().bg(SURFACE)
+}
+
+pub fn brand_chip() -> Style {
+    Style::new().fg(ON_ACCENT).bg(ACCENT).bold()
+}
+
+pub fn mode_chip() -> Style {
+    Style::new().bg(HAIRLINE).bold()
+}
+
+pub fn key() -> Style {
+    Style::new().bold()
 }
 
 pub fn title() -> Style {
-    Style::new()
-        .fg(DISCORD_BLURPLE_LIGHT)
-        .add_modifier(Modifier::BOLD)
+    Style::new().fg(ACCENT).bold()
 }
 
-// Error text
+pub fn popup_border() -> Style {
+    Style::new().fg(ACCENT)
+}
+
 pub fn error() -> Style {
-    Style::new().fg(Color::Red)
+    Style::new().fg(DANGER)
+}
+
+pub fn success() -> Style {
+    Style::new().fg(SUCCESS)
 }
 
 pub fn new_messages_divider() -> Style {
-    Style::new().fg(DISCORD_RED).add_modifier(Modifier::BOLD)
+    Style::new().fg(DANGER).bold()
 }
 
-// Dimmed / secondary text
+/// Secondary text. A fixed color: ANSI dark gray is too faint to read on
+/// many dark themes.
 pub fn dim() -> Style {
-    Style::new().fg(Color::DarkGray)
+    Style::new().fg(DIM)
 }
 
 pub fn muted() -> Style {
@@ -84,33 +113,25 @@ pub fn muted() -> Style {
 }
 
 pub fn mention() -> Style {
-    Style::new()
-        .fg(DISCORD_BLURPLE_LIGHT)
-        .add_modifier(Modifier::BOLD)
+    attention()
 }
 
 pub fn link() -> Style {
-    Style::new()
-        .fg(Color::LightBlue)
-        .add_modifier(Modifier::UNDERLINED)
+    Style::new().light_blue().underlined()
 }
 
 pub fn code() -> Style {
-    Style::new().fg(Color::Green)
+    Style::new().green()
 }
 
 pub fn quote() -> Style {
-    Style::new().fg(Color::LightMagenta)
+    Style::new().light_magenta()
 }
 
-// Summary header
 pub fn summary_header() -> Style {
-    Style::new()
-        .fg(DISCORD_BLURPLE_LIGHT)
-        .add_modifier(Modifier::BOLD)
+    Style::new().fg(ACCENT).bold()
 }
 
-// TODO bullet
 pub fn todo_bullet() -> Style {
-    Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    Style::new().yellow().bold()
 }

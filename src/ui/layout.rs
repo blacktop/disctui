@@ -2,18 +2,22 @@ use ratatui::layout::{Constraint, Layout, Rect};
 
 use crate::app::FocusPane;
 
-/// Top-level layout: body + status bar.
-pub fn root(area: Rect) -> [Rect; 2] {
-    Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area)
+/// Top-level layout: top bar, body, footer.
+pub fn root(area: Rect) -> [Rect; 3] {
+    Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ])
+    .areas(area)
 }
 
 /// Three-pane horizontal split: guilds | channels | main content.
 ///
-/// The sidebar widths adapt to focus and whether a channel is open so the
-/// active pane gets more space and the message view dominates once you are
-/// reading a channel.
-pub fn main_body(area: Rect, focus: FocusPane, has_selected_channel: bool) -> [Rect; 3] {
-    let (guild_width, channel_width) = pane_widths(area.width, focus, has_selected_channel);
+/// Narrow screens show the focused pane. Wider screens progressively restore
+/// the avatar rail and channel list.
+pub fn main_body(area: Rect, focus: FocusPane) -> [Rect; 3] {
+    let (guild_width, channel_width) = pane_widths(area.width, focus);
     Layout::horizontal([
         Constraint::Length(guild_width),
         Constraint::Length(channel_width),
@@ -27,119 +31,78 @@ pub fn message_pane(area: Rect, input_height: u16) -> [Rect; 2] {
     Layout::vertical([Constraint::Fill(1), Constraint::Length(input_height)]).areas(area)
 }
 
-/// Centered popup for help/error overlays.
-pub fn centered_popup(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
-    let [_, center_v, _] = Layout::vertical([
-        Constraint::Percentage((100 - percent_y) / 2),
-        Constraint::Percentage(percent_y),
-        Constraint::Percentage((100 - percent_y) / 2),
-    ])
-    .areas(area);
-
-    let [_, center, _] = Layout::horizontal([
-        Constraint::Percentage((100 - percent_x) / 2),
-        Constraint::Percentage(percent_x),
-        Constraint::Percentage((100 - percent_x) / 2),
-    ])
-    .areas(center_v);
-
-    center
-}
-
-fn pane_widths(total_width: u16, focus: FocusPane, has_selected_channel: bool) -> (u16, u16) {
-    let (guild_pct, channel_pct, guild_min, guild_max, channel_min, channel_max, main_min): (
-        u16,
-        u16,
-        u16,
-        u16,
-        u16,
-        u16,
-        u16,
-    ) = match (focus, has_selected_channel) {
-        (FocusPane::Guilds, _) => (28, 24, 18, 30, 18, 28, 34),
-        (FocusPane::Channels, _) => (8, 30, 7, 9, 20, 34, 34),
-        (FocusPane::Messages | FocusPane::Input, true) => (8, 18, 7, 9, 14, 24, 44),
-        _ => (12, 24, 10, 16, 18, 28, 36),
-    };
-
-    let mut guild =
-        u16::try_from((u32::from(total_width) * u32::from(guild_pct)) / 100).unwrap_or(u16::MAX);
-    let mut channel =
-        u16::try_from((u32::from(total_width) * u32::from(channel_pct)) / 100).unwrap_or(u16::MAX);
-
-    guild = guild.clamp(guild_min, guild_max.min(total_width));
-    channel = channel.clamp(
-        channel_min,
-        channel_max.min(total_width.saturating_sub(guild)),
-    );
-
-    let mut remaining_for_main = total_width.saturating_sub(guild.saturating_add(channel));
-    if remaining_for_main < main_min {
-        let mut overflow = main_min - remaining_for_main;
-
-        let shrink_channel = overflow.min(channel.saturating_sub(channel_min));
-        channel -= shrink_channel;
-        overflow -= shrink_channel;
-
-        let shrink_guild = overflow.min(guild.saturating_sub(guild_min));
-        guild -= shrink_guild;
-        overflow -= shrink_guild;
-
-        if overflow > 0 {
-            channel = channel.saturating_sub(overflow.min(channel.saturating_sub(8)));
-        }
-
-        remaining_for_main = total_width.saturating_sub(guild.saturating_add(channel));
-        if remaining_for_main == 0 {
-            channel = channel.saturating_sub(1);
-        }
+fn pane_widths(total_width: u16, focus: FocusPane) -> (u16, u16) {
+    if total_width < 72 {
+        return match focus {
+            FocusPane::Guilds => (total_width, 0),
+            FocusPane::Channels => (0, total_width),
+            FocusPane::Messages | FocusPane::Input => (0, 0),
+        };
     }
-
-    (guild, channel)
+    if total_width < 105 {
+        return match focus {
+            FocusPane::Guilds => (30.min(total_width), total_width.saturating_sub(30)),
+            FocusPane::Channels => (7, total_width.saturating_sub(7)),
+            FocusPane::Messages | FocusPane::Input => (7, 0),
+        };
+    }
+    let channel = (total_width / 5).clamp(22, 30);
+    match focus {
+        FocusPane::Guilds => (30, channel),
+        FocusPane::Channels => (7, channel.max(28)),
+        FocusPane::Messages | FocusPane::Input => (7, channel),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::ui::layout::*;
 
     #[test]
-    fn root_splits_body_and_status() {
+    fn root_splits_top_bar_body_and_footer() {
         let area = Rect::new(0, 0, 80, 24);
-        let [body, status] = root(area);
-        assert_eq!(status.height, 1);
-        assert_eq!(body.height, 23);
+        let [top, body, footer] = root(area);
+        assert_eq!(top.height, 1);
+        assert_eq!(footer.height, 1);
+        assert_eq!(body.height, 22);
         assert_eq!(body.width, 80);
+        assert_eq!(footer.y, 23);
     }
 
     #[test]
     fn main_body_three_panes() {
         let area = Rect::new(0, 0, 80, 23);
-        let [guilds, channels, main] = main_body(area, FocusPane::Messages, true);
+        let [guilds, channels, main] = main_body(area, FocusPane::Messages);
         assert_eq!(guilds.width + channels.width + main.width, 80);
         assert!(main.width > channels.width);
     }
 
     #[test]
     fn narrow_terminal_still_renders() {
-        // Terminal narrower than guild + channel sidebars
-        let area = Rect::new(0, 0, 30, 10);
-        let [body, status] = root(area);
-        assert_eq!(status.height, 1);
-
-        let [guilds, channels, main] = main_body(body, FocusPane::Messages, true);
-        // Ratatui clamps — sidebars take priority, main gets remainder
-        assert!(guilds.width > 0);
-        assert!(channels.width > 0);
-        // Main pane may be 0 width in very narrow terminals
-        assert_eq!(guilds.width + channels.width + main.width, body.width);
+        for width in [1, 30, 71] {
+            let area = Rect::new(0, 0, width, 10);
+            assert_eq!(
+                main_body(area, FocusPane::Guilds).map(|r| r.width),
+                [width, 0, 0]
+            );
+            assert_eq!(
+                main_body(area, FocusPane::Channels).map(|r| r.width),
+                [0, width, 0]
+            );
+            assert_eq!(
+                main_body(area, FocusPane::Messages).map(|r| r.width),
+                [0, 0, width]
+            );
+        }
     }
 
     #[test]
     fn very_short_terminal() {
         let area = Rect::new(0, 0, 80, 3);
-        let [body, status] = root(area);
-        assert_eq!(status.height, 1);
-        assert_eq!(body.height, 2);
+        let [top, body, footer] = root(area);
+        assert_eq!(top.height, 1);
+        assert_eq!(footer.height, 1);
+        assert_eq!(body.height, 1);
     }
 
     #[test]
@@ -151,27 +114,32 @@ mod tests {
     }
 
     #[test]
-    fn centered_popup_is_centered() {
-        let area = Rect::new(0, 0, 100, 50);
-        let popup = centered_popup(60, 60, area);
-        // Should be roughly centered
-        assert!(popup.x > 0);
-        assert!(popup.y > 0);
-        assert!(popup.x + popup.width <= area.width);
-        assert!(popup.y + popup.height <= area.height);
+    fn panes_never_exceed_a_terminal_narrower_than_their_minimums() {
+        for width in 0..40 {
+            for focus in [
+                FocusPane::Guilds,
+                FocusPane::Channels,
+                FocusPane::Messages,
+                FocusPane::Input,
+            ] {
+                let area = Rect::new(0, 0, width, 10);
+                let [guilds, channels, main] = main_body(area, focus);
+                assert_eq!(guilds.width + channels.width + main.width, width);
+            }
+        }
     }
 
     #[test]
     fn messages_focus_gives_main_pane_majority_width() {
         let area = Rect::new(0, 0, 120, 30);
-        let [guilds, channels, main] = main_body(area, FocusPane::Messages, true);
+        let [guilds, channels, main] = main_body(area, FocusPane::Messages);
         assert!(main.width > guilds.width + channels.width);
     }
 
     #[test]
     fn channel_focus_expands_channel_sidebar() {
         let area = Rect::new(0, 0, 120, 30);
-        let [guilds, channels, _main] = main_body(area, FocusPane::Channels, true);
+        let [guilds, channels, _main] = main_body(area, FocusPane::Channels);
         assert!(channels.width > guilds.width);
     }
 }

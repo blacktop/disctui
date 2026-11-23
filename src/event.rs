@@ -60,6 +60,7 @@ fn map_normal_mode(key: &KeyEvent, focus: FocusPane) -> Option<Action> {
         KeyCode::Char('?') => Some(Action::ToggleHelp),
         KeyCode::Char('R') => Some(Action::MarkAllRead),
         KeyCode::Char('s') => Some(Action::RequestSummary),
+        KeyCode::Char('S') => Some(Action::RegenerateDigest),
         KeyCode::Char('m') | KeyCode::Esc => Some(Action::ShowMessages),
         _ => None,
     }
@@ -94,7 +95,7 @@ fn map_insert_mode(key: &KeyEvent) -> Option<Action> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::event::*;
 
     #[test]
     fn left_arrow_cycles_focus_across_main_panes() {

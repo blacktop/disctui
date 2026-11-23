@@ -1,6 +1,8 @@
 use std::collections::HashMap;
+use std::time::Instant;
 
 use crate::app::FocusPane;
+use crate::digest::DigestReport;
 use crate::model::{
     ChannelDigest, ChannelSummary, GuildMuteSettings, GuildSummary, LoadScope, MessageRow,
 };
@@ -29,6 +31,8 @@ pub enum Action {
     ScrollUp(u16),
     ScrollDown(u16),
     OpenSelected,
+    /// Open a channel by id, from `--open` or the control socket.
+    OpenChannel(String),
     CloseSelectedDirectMessage,
     RefreshNow,
     ReconnectTransport,
@@ -41,7 +45,30 @@ pub enum Action {
     ExitInsert,
     ToggleHelp,
     SubmitDiscordToken,
+    /// Leave the sign-in prompt and browse sample data.
     CancelDiscordToken,
+    /// Switch the sign-in prompt to pasting a token.
+    ShowTokenEntry,
+    /// Leave the token field for the first sign-in screen.
+    LeaveTokenEntry,
+    /// Open Discord's own sign-in window for a message session.
+    #[cfg(feature = "experimental-discord")]
+    WebSignIn,
+    /// How far that window has got.
+    #[cfg(feature = "experimental-discord")]
+    WebSignInProgress(crate::app::WebStage),
+    /// The window saved a validated session in the Keychain.
+    #[cfg(feature = "experimental-discord")]
+    WebSignInSaved,
+    /// Why the window produced no session.
+    #[cfg(feature = "experimental-discord")]
+    WebSignInFailed(String),
+    #[cfg(feature = "experimental-discord")]
+    BrowserSignIn,
+    #[cfg(feature = "experimental-discord")]
+    BrowserSignOut,
+    #[cfg(feature = "experimental-discord")]
+    CancelBrowser,
 
     // Read state
     MarkAllRead,
@@ -64,6 +91,13 @@ pub enum Action {
         username: String,
     },
     TransportDisconnected(String),
+    TransportSessionExpired,
+    #[cfg(feature = "experimental-discord")]
+    MessageSessionRejected {
+        session: std::time::Instant,
+        channel_id: String,
+        message: String,
+    },
 
     // Data loading
     GuildsLoaded(Vec<GuildSummary>),
@@ -99,6 +133,11 @@ pub enum Action {
     // AI
     SummaryReady(ChannelDigest),
     SummaryFailed(String),
+    RegenerateDigest,
+    DigestReady {
+        job: Instant,
+        report: DigestReport,
+    },
     AvatarLoaded {
         url: String,
         bytes: Vec<u8>,
@@ -106,4 +145,86 @@ pub enum Action {
     AvatarFailed(String),
 
     Error(String),
+}
+
+/// Where an action comes from. A modal popup drops what the person typed and
+/// keeps what the transport, the AI backend, and the control socket deliver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// A key press or mouse click.
+    Input,
+    /// The tick timer or a terminal resize.
+    Clock,
+    /// Anything else: transport events, finished background work, control requests.
+    Delivered,
+}
+
+impl Action {
+    pub const fn origin(&self) -> Origin {
+        match self {
+            Self::Tick | Self::Resize { .. } => Origin::Clock,
+            Self::Quit
+            | Self::FocusNext
+            | Self::FocusPrev
+            | Self::SetFocus(_)
+            | Self::MoveUp
+            | Self::MoveDown
+            | Self::JumpTop
+            | Self::JumpBottom
+            | Self::ScrollUp(_)
+            | Self::ScrollDown(_)
+            | Self::OpenSelected
+            | Self::CloseSelectedDirectMessage
+            | Self::RefreshNow
+            | Self::ReconnectTransport
+            | Self::EnterInsert
+            | Self::ExitInsert
+            | Self::ToggleHelp
+            | Self::SubmitDiscordToken
+            | Self::CancelDiscordToken
+            | Self::ShowTokenEntry
+            | Self::LeaveTokenEntry
+            | Self::MarkAllRead
+            | Self::ShowMessages
+            | Self::ShowSummary
+            | Self::RequestSummary
+            | Self::SummarySelectNextTodo
+            | Self::SummarySelectPrevTodo
+            | Self::JumpToTodoMessage
+            | Self::StartQuickReplyFromSummary
+            | Self::SendCurrentMessage
+            | Self::RegenerateDigest => Origin::Input,
+            #[cfg(feature = "experimental-discord")]
+            Self::WebSignIn | Self::BrowserSignIn | Self::BrowserSignOut | Self::CancelBrowser => {
+                Origin::Input
+            }
+            Self::OpenChannel(_)
+            | Self::LoadStarted(_)
+            | Self::LoadFailed { .. }
+            | Self::TransportConnecting
+            | Self::TransportConnected { .. }
+            | Self::TransportDisconnected(_)
+            | Self::TransportSessionExpired
+            | Self::GuildsLoaded(_)
+            | Self::ReadyData { .. }
+            | Self::GuildAvailable { .. }
+            | Self::GuildMuteSettingsUpdated(_)
+            | Self::ChannelsLoaded { .. }
+            | Self::HistoryLoaded { .. }
+            | Self::MessageAppended { .. }
+            | Self::MessagePatched(_)
+            | Self::MessageRemoved { .. }
+            | Self::SummaryReady(_)
+            | Self::SummaryFailed(_)
+            | Self::DigestReady { .. }
+            | Self::AvatarLoaded { .. }
+            | Self::AvatarFailed(_)
+            | Self::Error(_) => Origin::Delivered,
+            #[cfg(feature = "experimental-discord")]
+            Self::WebSignInProgress(_)
+            | Self::WebSignInSaved
+            | Self::WebSignInFailed(_)
+            | Self::MessageSessionRejected { .. } => Origin::Delivered,
+        }
+    }
 }

@@ -6,7 +6,7 @@
 #   3. --config /path/to/config.toml
 #
 # Discord auth is not read from this file.
-# Use DISCTUI_TOKEN or the startup Keychain-backed token prompt instead.
+# Sign in at the prompt disctui shows at startup, or set DISCTUI_TOKEN.
 
 # UI tick cadence in milliseconds.
 tick_rate_ms = 250
@@ -17,12 +17,24 @@ mouse = false
 # AI summary backend:
 #   auto   = prefer Anthropic env var, otherwise configured local endpoint
 #   claude = Anthropic API key from ANTHROPIC_API_KEY
-#   local  = OpenAI-compatible local endpoint
+#   local  = OpenAI-compatible endpoint (LM Studio, Ollama, llama.cpp, or hosted)
 #   none   = disable summaries
+# The same backend serves the in-app summary (s) and `disctui digest`.
 ai_backend = "auto"
 
 # Used when ai_backend = "local", or as the auto-mode local fallback.
 # ai_base_url = "http://localhost:1234/v1"
 
 # Optional model override for the selected AI backend.
+# Defaults: claude-haiku-5-5 for claude, google/gemma-4-26b-a4b for local.
 # ai_model = "google/gemma-4-26b-a4b"
+
+# Bearer token for a hosted OpenAI-compatible endpoint. Local servers need none.
+# Prefer the DISCTUI_AI_API_KEY environment variable over writing it here.
+# ai_api_key = ""
+
+# Digest whitelist. Each entry is a server, or "Server #channel" for one
+# channel. Names match as case-insensitive substrings; an id matches exactly.
+# Empty or unset means every server. A channel with unread mentions of you is
+# always included, and `disctui digest --guild` replaces this list for one run.
+# digest_include = ["Rust Lang", "Tokio #announcements"]

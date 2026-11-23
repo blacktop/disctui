@@ -2,7 +2,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::Paragraph;
 use textwrap::wrap;
 use unicode_width::UnicodeWidthStr;
 
@@ -35,37 +35,23 @@ struct ImageMarker {
     filename: String,
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "message pane renderer takes viewport, loading, unread-divider, and avatar state"
-)]
+/// Columns left empty between the pane edge and the avatar gutter.
+const LEFT_PADDING: u16 = 1;
+
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     messages: &[MessageRow],
     unread_divider_message_id: Option<&str>,
     scroll_offset: u16,
-    loading_bar: Option<&str>,
-    focused: bool,
     avatars: &mut AvatarStore,
 ) -> u16 {
-    let border_style = if focused {
-        theme::focused_border()
-    } else {
-        theme::unfocused_border()
+    let inner = Rect {
+        x: area.x + LEFT_PADDING.min(area.width),
+        y: area.y,
+        width: area.width.saturating_sub(LEFT_PADDING),
+        height: area.height,
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(Span::styled(
-            loading_bar.map_or_else(
-                || " Messages ".to_string(),
-                |bar| format!(" Messages {bar} "),
-            ),
-            theme::title(),
-        ));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
 
     let text_area = Rect {
         x: inner.x + AVATAR_GUTTER_WIDTH.min(inner.width),
@@ -195,22 +181,15 @@ fn build_message_layout(
     }
 }
 
+/// A rule across the pane ending in a "new" label, above the first unread message.
 fn new_messages_divider_line(text_width: u16) -> Line<'static> {
+    let label = " new ";
     let width = usize::from(text_width.max(12));
-    let label = " New Messages ";
-    let label_width = label.width();
-    if width <= label_width {
-        return Line::from(Span::styled(label, theme::new_messages_divider()));
-    }
-
-    let side_width = (width.saturating_sub(label_width)) / 2;
-    let left = "─".repeat(side_width);
-    let right = "─".repeat(width.saturating_sub(label_width).saturating_sub(side_width));
+    let rule = "\u{2500}".repeat(width.saturating_sub(label.width()));
 
     Line::from(vec![
-        Span::styled(left, theme::new_messages_divider()),
+        Span::styled(rule, theme::new_messages_divider()),
         Span::styled(label, theme::new_messages_divider()),
-        Span::styled(right, theme::new_messages_divider()),
     ])
 }
 

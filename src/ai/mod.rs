@@ -4,6 +4,8 @@ mod prompt;
 
 use color_eyre::eyre::Result;
 
+use crate::ai::claude::ClaudeSummarizer;
+use crate::ai::local::LocalSummarizer;
 use crate::model::{ChannelDigest, MessageRow};
 
 /// Trait for AI-powered conversation summarization.
@@ -24,7 +26,7 @@ const MAX_SUMMARY_MESSAGES: usize = 100;
 const MAX_SUMMARY_CHARS: usize = 50_000;
 
 /// Truncate and cap messages before sending to the AI backend.
-pub fn prepare_messages_for_summary(messages: &[MessageRow]) -> Vec<MessageRow> {
+fn prepare_messages_for_summary(messages: &[MessageRow]) -> Vec<MessageRow> {
     let mut total_chars = 0;
     let mut result = Vec::new();
 
@@ -52,7 +54,7 @@ pub fn prepare_messages_for_summary(messages: &[MessageRow]) -> Vec<MessageRow> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::ai::*;
     use crate::model::MessageRow;
 
     fn msg(id: &str, content: &str) -> MessageRow {
@@ -104,7 +106,47 @@ mod tests {
 #[derive(Debug, Clone)]
 pub enum SummarizerBackend {
     /// Claude API (requires `ANTHROPIC_API_KEY`)
-    Claude { api_key: String },
-    /// Local LLM via OpenAI-compatible API (LM Studio, ollama, etc.)
-    Local { base_url: String, model: String },
+    Claude { api_key: String, model: String },
+    /// OpenAI-compatible chat completions endpoint: a local server (LM Studio,
+    /// Ollama) or a hosted one when `api_key` is set.
+    Local {
+        base_url: String,
+        model: String,
+        api_key: Option<String>,
+    },
+}
+
+impl SummarizerBackend {
+    /// Summarize one channel's messages with this backend.
+    pub async fn summarize(
+        &self,
+        channel_name: &str,
+        messages: &[MessageRow],
+        user_name: &str,
+    ) -> Result<ChannelDigest> {
+        let prepared = prepare_messages_for_summary(messages);
+        match self {
+            Self::Claude { api_key, model } => {
+                ClaudeSummarizer::new(api_key.clone(), model.clone())
+                    .summarize(channel_name, &prepared, user_name)
+                    .await
+            }
+            Self::Local {
+                base_url,
+                model,
+                api_key,
+            } => {
+                LocalSummarizer::new(base_url.clone(), model.clone(), api_key.clone())
+                    .summarize(channel_name, &prepared, user_name)
+                    .await
+            }
+        }
+    }
+
+    /// Short name for status lines and digest headers.
+    pub fn label(&self) -> String {
+        match self {
+            Self::Claude { model, .. } | Self::Local { model, .. } => model.clone(),
+        }
+    }
 }

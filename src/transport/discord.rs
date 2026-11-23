@@ -31,7 +31,7 @@ impl DiscordBridge {
                 tracing::warn!("action channel full, dropping event");
             }
             Err(TrySendError::Closed(_)) => {
-                tracing::warn!("action channel closed, dropping event");
+                tracing::debug!("action channel closed, dropping event");
             }
         }
     }
@@ -102,8 +102,7 @@ impl EventHandler for DiscordBridge {
             let channels: Vec<ChannelSummary> = guild
                 .get("channels")
                 .and_then(serde_json::Value::as_array)
-                .map(|arr| parse_channels_from_json(arr, id))
-                .unwrap_or_default();
+                .map_or_default(|arr| parse_channels_from_json(arr, id));
 
             if !channels.is_empty() {
                 all_channels.insert(id.to_string(), channels);
@@ -191,8 +190,7 @@ impl EventHandler for DiscordBridge {
         let channels: Vec<ChannelSummary> = data
             .get("channels")
             .and_then(serde_json::Value::as_array)
-            .map(|arr| parse_channels_from_json(arr, id))
-            .unwrap_or_default();
+            .map_or_default(|arr| parse_channels_from_json(arr, id));
 
         self.send(Action::GuildAvailable {
             guild: guild_to_summary(
@@ -209,32 +207,51 @@ impl EventHandler for DiscordBridge {
 }
 
 /// Start the diself client and return a handle for shutdown.
+///
+/// The Gateway presents the client properties saved with `token`, when the
+/// session was created in the login `WebView`.
 pub fn connect(
     token: String,
     tx: mpsc::Sender<Action>,
 ) -> color_eyre::eyre::Result<(Arc<diself::Client>, tokio::task::JoinHandle<()>)> {
     let err_tx = tx.clone();
     let bridge = DiscordBridge::new(tx);
-
-    let client = Arc::new(
-        diself::Client::builder(token, bridge)
-            .map_err(|e| color_eyre::eyre::eyre!("failed to build discord client: {e}"))?
-            .with_cache_config(CacheConfig {
-                cache_users: true,
-                cache_channels: true,
-                cache_guilds: false,
-                cache_relationships: false,
-            })
-            .build(),
+    let client_properties = crate::auth::client_properties_for(&token);
+    tracing::info!(
+        "gateway identity: {}",
+        if client_properties.is_some() {
+            "client properties saved with the session"
+        } else {
+            "disctui"
+        }
     );
+
+    let mut builder = diself::Client::builder(token, bridge)
+        .map_err(|e| color_eyre::eyre::eyre!("failed to build discord client: {e}"))?
+        .with_cache_config(CacheConfig {
+            cache_users: true,
+            cache_channels: true,
+            cache_guilds: false,
+            cache_relationships: false,
+        });
+    if let Some(properties) = client_properties {
+        builder = builder.with_client_properties(properties);
+    }
+    let client = Arc::new(builder.build());
 
     let runner = Arc::clone(&client);
     let handle = tokio::spawn(async move {
         if let Err(e) = runner.start().await {
-            tracing::error!("discord client error: {e}");
-            let _ = err_tx
-                .send(Action::TransportDisconnected(format!("gateway error: {e}")))
-                .await;
+            let action = match e {
+                diself::Error::GatewayAuthenticationFailed
+                | diself::Error::Api { status: 401, .. } => Action::TransportSessionExpired,
+                diself::Error::Api { status, .. } => {
+                    Action::TransportDisconnected(format!("Discord returned HTTP {status}"))
+                }
+                _ => Action::TransportDisconnected("Lost the Discord connection".into()),
+            };
+            tracing::warn!("Discord connection ended: {action:?}");
+            let _ = err_tx.send(action).await;
         }
     });
 
@@ -528,9 +545,17 @@ fn parse_read_state(data: &serde_json::Value) -> std::collections::HashMap<Strin
     unread
 }
 
+/// Set by Discord on a channel the user cannot view. Its name is replaced
+/// with a placeholder and reading it returns HTTP 403.
+const CHANNEL_OBFUSCATED: u64 = 1 << 17;
+
 fn parse_channels_from_json(arr: &[serde_json::Value], guild_id: &str) -> Vec<ChannelSummary> {
     let mut channels: Vec<ChannelSummary> = arr
         .iter()
+        .filter(|ch| {
+            let flags = ch.get("flags").and_then(serde_json::Value::as_u64);
+            flags.is_none_or(|flags| flags & CHANNEL_OBFUSCATED == 0)
+        })
         .filter_map(|ch| {
             let ch_type = ch
                 .get("type")
@@ -604,13 +629,18 @@ pub fn channel_to_summary(ch: &diself::Channel) -> Option<ChannelSummary> {
     })
 }
 
-pub fn channels_to_summaries(channels: &[diself::Channel]) -> Vec<ChannelSummary> {
+/// Sidebar-ordered summaries of `channels`, with unread state from `cache`.
+pub fn channels_to_summaries(
+    channels: &[diself::Channel],
+    cache: &diself::Cache,
+) -> Vec<ChannelSummary> {
     let mut summaries: Vec<_> = channels.iter().filter_map(channel_to_summary).collect();
     sort_channels_for_sidebar(&mut summaries);
+    apply_read_state_from_cache(&mut summaries, cache);
     summaries
 }
 
-pub fn apply_read_state_from_cache(channels: &mut [ChannelSummary], cache: &diself::Cache) {
+fn apply_read_state_from_cache(channels: &mut [ChannelSummary], cache: &diself::Cache) {
     for channel in channels {
         let Some(read_state) = cache.read_state(&channel.id) else {
             continue;
@@ -844,6 +874,29 @@ struct HistoryAttachmentPayload {
     height: Option<u64>,
 }
 
+/// Ids of the history messages whose mention list names `user_id`. Discord
+/// lists a user there for a direct mention and for a reply that pings them.
+pub fn ids_of_messages_mentioning(history: &serde_json::Value, user_id: &str) -> HashSet<String> {
+    let names_user = |message: &&serde_json::Value| {
+        message
+            .get("mentions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|mentions| {
+                mentions
+                    .iter()
+                    .any(|user| user.get("id").and_then(serde_json::Value::as_str) == Some(user_id))
+            })
+    };
+    history
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(names_user)
+        .filter_map(|message| message.get("id").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
 pub fn history_rows_from_value(
     requested_channel_id: &str,
     value: serde_json::Value,
@@ -928,7 +981,27 @@ fn parse_discord_timestamp(ts: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::transport::discord::*;
+
+    #[test]
+    fn messages_that_list_the_user_as_mentioned_are_found_by_id() {
+        let history = serde_json::json!([
+            { "id": "1", "content": "<@42> ping", "mentions": [{ "id": "42" }] },
+            { "id": "2", "content": "a reply that pings", "mentions": [{ "id": "7" }, { "id": "42" }] },
+            { "id": "3", "content": "someone else", "mentions": [{ "id": "7" }] },
+            { "id": "4", "content": "@42 typed by hand", "mentions": [] },
+            { "id": "5", "content": "no mention list" },
+        ]);
+
+        assert_eq!(
+            ids_of_messages_mentioning(&history, "42"),
+            HashSet::from(["1".to_string(), "2".to_string()])
+        );
+        assert_eq!(
+            ids_of_messages_mentioning(&serde_json::json!({}), "42"),
+            HashSet::new()
+        );
+    }
 
     #[test]
     fn mentioned_user_ids_extracts_unique_plain_and_nick_mentions() {
@@ -990,6 +1063,20 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].channel_id, "dm1");
         assert_eq!(rows[0].content, "hi @Bob");
+    }
+
+    #[test]
+    fn channels_the_user_cannot_view_are_left_out_of_the_sidebar() {
+        let channels = [
+            serde_json::json!({"id": "1", "type": 0, "name": "general", "flags": 0}),
+            serde_json::json!({"id": "2", "type": 0, "name": "___hidden___", "flags": 1 << 17}),
+            serde_json::json!({"id": "3", "type": 4, "name": "___hidden___", "flags": 131_073}),
+            serde_json::json!({"id": "4", "type": 5, "name": "news"}),
+        ];
+        let parsed = parse_channels_from_json(&channels, "9");
+        let mut ids: Vec<&str> = parsed.iter().map(|channel| channel.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["1", "4"]);
     }
 
     #[test]

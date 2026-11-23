@@ -5,6 +5,11 @@ use color_eyre::eyre::{Result, WrapErr};
 use serde::Deserialize;
 
 use crate::ai::SummarizerBackend;
+use crate::ai::{claude, local};
+use crate::digest::Include;
+
+pub const NO_AI_BACKEND_HELP: &str =
+    "No AI backend configured. Set ANTHROPIC_API_KEY, or ai_backend = \"local\" with ai_base_url";
 
 #[derive(Debug, Deserialize)]
 #[serde(default)]
@@ -14,6 +19,11 @@ pub struct AppConfig {
     pub ai_backend: String,
     pub ai_base_url: Option<String>,
     pub ai_model: Option<String>,
+    /// Bearer token for the OpenAI-compatible endpoint. Local servers need none.
+    pub ai_api_key: Option<String>,
+    /// Digest whitelist: `Server`, or `Server #channel` for one channel.
+    /// Empty means every server.
+    pub digest_include: Vec<String>,
 }
 
 impl Default for AppConfig {
@@ -24,6 +34,8 @@ impl Default for AppConfig {
             ai_backend: "auto".into(),
             ai_base_url: None,
             ai_model: None,
+            ai_api_key: None,
+            digest_include: Vec::new(),
         }
     }
 }
@@ -52,13 +64,21 @@ impl AppConfig {
             builder = builder.add_source(config::File::from(path.to_path_buf()));
         }
 
-        builder = builder.add_source(
-            config::Environment::with_prefix("DISCTUI")
-                .separator("_")
-                .try_parsing(true),
-        );
+        // No key separator: `DISCTUI_AI_BACKEND` must map to the flat `ai_backend` key.
+        builder = builder.add_source(config::Environment::with_prefix("DISCTUI").try_parsing(true));
 
+        // Scalar inference in config::Environment runs before list splitting, even for
+        // numeric guild IDs. Preserve the original text for this one list setting.
+        let include = std::env::var("DISCTUI_DIGEST_INCLUDE").ok().map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        });
         let cfg = builder
+            .set_override_option("digest_include", include)?
             .build()
             .wrap_err("failed to build configuration")?
             .try_deserialize()
@@ -67,54 +87,68 @@ impl AppConfig {
         Ok(cfg)
     }
 
+    /// The digest whitelist, with blank entries dropped.
+    pub fn digest_include(&self) -> Vec<Include> {
+        self.digest_include
+            .iter()
+            .filter_map(|entry| Include::parse(entry))
+            .collect()
+    }
+
     pub fn tick_rate(&self) -> Duration {
         Duration::from_millis(self.tick_rate_ms)
     }
 
     /// Resolve which AI summarizer backend to use.
     ///
-    /// Resolution order for "auto" mode:
-    /// 1. If `ANTHROPIC_API_KEY` is set -> Claude
-    /// 2. If local LLM endpoint is reachable -> Local
-    /// 3. None (no backend available)
-    ///
-    /// Explicit modes: "claude", "local", "none"
+    /// - `claude`: Claude API, needs `ANTHROPIC_API_KEY`
+    /// - `local`: OpenAI-compatible endpoint at `ai_base_url`
+    /// - `none`: summaries disabled
+    /// - `auto` (default): Claude when `ANTHROPIC_API_KEY` is set, otherwise the
+    ///   OpenAI-compatible endpoint when `ai_base_url` is configured
     pub fn summarizer_backend(&self) -> Option<SummarizerBackend> {
+        self.resolve_backend(anthropic_api_key())
+    }
+
+    fn resolve_backend(&self, anthropic_key: Option<String>) -> Option<SummarizerBackend> {
         match self.ai_backend.as_str() {
-            "claude" => {
-                let key = anthropic_api_key()?;
-                Some(SummarizerBackend::Claude { api_key: key })
-            }
-            "local" => Some(SummarizerBackend::Local {
-                base_url: self
-                    .ai_base_url
-                    .clone()
-                    .unwrap_or_else(|| "http://localhost:1234/v1".into()),
-                model: self
-                    .ai_model
-                    .clone()
-                    .unwrap_or_else(|| "google/gemma-4-26b-a4b".into()),
-            }),
+            "claude" => anthropic_key.map(|api_key| self.claude_backend(api_key)),
+            "local" => Some(
+                self.local_backend(
+                    self.ai_base_url
+                        .clone()
+                        .unwrap_or_else(|| local::DEFAULT_BASE_URL.into()),
+                ),
+            ),
             "none" => None,
-            // "auto" or anything else
-            _ => {
-                // Try Claude first
-                if let Some(key) = anthropic_api_key() {
-                    return Some(SummarizerBackend::Claude { api_key: key });
-                }
-                // Only fall back to local if a base URL is explicitly configured
-                if let Some(base_url) = self.ai_base_url.clone() {
-                    return Some(SummarizerBackend::Local {
-                        base_url,
-                        model: self
-                            .ai_model
-                            .clone()
-                            .unwrap_or_else(|| "google/gemma-4-26b-a4b".into()),
-                    });
-                }
-                // No backend available
-                None
-            }
+            _ => anthropic_key
+                .map(|api_key| self.claude_backend(api_key))
+                .or_else(|| {
+                    self.ai_base_url
+                        .clone()
+                        .map(|base_url| self.local_backend(base_url))
+                }),
+        }
+    }
+
+    fn claude_backend(&self, api_key: String) -> SummarizerBackend {
+        SummarizerBackend::Claude {
+            api_key,
+            model: self
+                .ai_model
+                .clone()
+                .unwrap_or_else(|| claude::DEFAULT_MODEL.into()),
+        }
+    }
+
+    fn local_backend(&self, base_url: String) -> SummarizerBackend {
+        SummarizerBackend::Local {
+            base_url,
+            model: self
+                .ai_model
+                .clone()
+                .unwrap_or_else(|| local::DEFAULT_MODEL.into()),
+            api_key: self.ai_api_key.clone().filter(|key| !key.is_empty()),
         }
     }
 }
@@ -123,4 +157,110 @@ fn anthropic_api_key() -> Option<String> {
     std::env::var("ANTHROPIC_API_KEY")
         .ok()
         .filter(|s| !s.is_empty())
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::panic,
+    reason = "a wrong backend variant should fail the test loudly"
+)]
+mod tests {
+    use crate::config::*;
+
+    #[test]
+    fn digest_whitelist_is_empty_by_default_and_drops_blank_entries() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(cfg.digest_include(), Vec::<Include>::new());
+
+        cfg.digest_include = vec!["Tokio #changelog".into(), "  ".into()];
+        assert_eq!(
+            cfg.digest_include(),
+            Vec::from_iter(Include::parse("tokio #changelog"))
+        );
+    }
+
+    fn config(backend: &str) -> AppConfig {
+        AppConfig {
+            ai_backend: backend.into(),
+            ..AppConfig::default()
+        }
+    }
+
+    #[test]
+    fn auto_prefers_claude_when_a_key_is_present() {
+        let mut cfg = config("auto");
+        cfg.ai_base_url = Some("http://localhost:11434/v1".into());
+
+        let backend = cfg.resolve_backend(Some("sk-test".into()));
+        let Some(SummarizerBackend::Claude { model, .. }) = backend else {
+            panic!("expected Claude backend, got {backend:?}");
+        };
+        assert_eq!(model, claude::DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn auto_falls_back_to_configured_endpoint() {
+        let mut cfg = config("auto");
+        cfg.ai_base_url = Some("http://localhost:11434/v1".into());
+        cfg.ai_model = Some("llama3".into());
+
+        let backend = cfg.resolve_backend(None);
+        let Some(SummarizerBackend::Local {
+            base_url,
+            model,
+            api_key,
+        }) = backend
+        else {
+            panic!("expected local backend, got {backend:?}");
+        };
+        assert_eq!(base_url, "http://localhost:11434/v1");
+        assert_eq!(model, "llama3");
+        assert_eq!(api_key, None);
+    }
+
+    #[test]
+    fn auto_without_key_or_endpoint_has_no_backend() {
+        assert!(config("auto").resolve_backend(None).is_none());
+    }
+
+    #[test]
+    fn none_disables_summaries_even_with_a_key() {
+        assert!(config("none").resolve_backend(Some("sk".into())).is_none());
+    }
+
+    #[test]
+    fn claude_without_a_key_has_no_backend() {
+        assert!(config("claude").resolve_backend(None).is_none());
+    }
+
+    #[test]
+    fn model_override_applies_to_claude() {
+        let mut cfg = config("claude");
+        cfg.ai_model = Some("claude-sonnet-5-5".into());
+
+        let backend = cfg.resolve_backend(Some("sk".into()));
+        let Some(SummarizerBackend::Claude { model, .. }) = backend else {
+            panic!("expected Claude backend, got {backend:?}");
+        };
+        assert_eq!(model, "claude-sonnet-5-5");
+    }
+
+    #[test]
+    fn local_uses_defaults_and_carries_the_api_key() {
+        let mut cfg = config("local");
+        cfg.ai_api_key = Some("token".into());
+
+        let backend = cfg.resolve_backend(None);
+        let Some(SummarizerBackend::Local {
+            base_url,
+            model,
+            api_key,
+        }) = backend
+        else {
+            panic!("expected local backend, got {backend:?}");
+        };
+        assert_eq!(base_url, local::DEFAULT_BASE_URL);
+        assert_eq!(model, local::DEFAULT_MODEL);
+        assert_eq!(api_key.as_deref(), Some("token"));
+    }
 }

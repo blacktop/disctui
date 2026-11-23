@@ -55,6 +55,26 @@ pub fn init(debug: bool) -> Result<()> {
     Ok(())
 }
 
+/// Logging for headless commands: warnings and errors go to stderr, and the
+/// TUI's log file is left alone.
+pub fn init_headless(debug: bool) {
+    let filter = if debug {
+        EnvFilter::new("debug")
+    } else {
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"))
+    };
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_target(false)
+                .without_time(),
+        )
+        .init();
+}
+
 /// Redirect stderr (fd 2) to the given file using dup2.
 fn redirect_stderr(file: &File) -> Result<()> {
     // SAFETY: dup2 is a standard POSIX call. We own the file descriptor.

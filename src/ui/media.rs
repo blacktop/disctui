@@ -123,6 +123,9 @@ impl AvatarStore {
         fallback_color: ratatui::style::Color,
         tone: AvatarTone,
     ) {
+        if area.is_empty() {
+            return;
+        }
         let Some(url) = url else {
             render_fallback(frame, area, fallback_label, fallback_color, tone);
             return;
@@ -152,7 +155,7 @@ impl AvatarStore {
 }
 
 fn centered_render_area(protocol: &StatefulProtocol, area: Rect) -> Rect {
-    let fitted = protocol.size_for(Resize::Fit(None), area);
+    let fitted = protocol.size_for(Resize::Fit(None), area.into());
     let width = fitted.width.min(area.width);
     let height = fitted.height.min(area.height);
     let x = area.x + area.width.saturating_sub(width) / 2;

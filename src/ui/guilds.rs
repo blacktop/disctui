@@ -1,10 +1,11 @@
+use crate::app::DigestPaneState;
 use crate::model::GuildSummary;
 use crate::ui::media::{AvatarStore, AvatarTone, badge_from_name};
 use crate::ui::theme;
 use crate::ui::truncate_name;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Margin, Rect};
-use ratatui::style::{Modifier, Style, Stylize};
+use ratatui::style::Stylize;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
@@ -28,22 +29,43 @@ pub fn render(
     loading_bar: Option<&str>,
     selected_guild_id: Option<&str>,
     avatars: &mut AvatarStore,
+    digest: Option<&DigestPaneState>,
 ) {
-    let border_style = if focused {
-        theme::focused_border()
-    } else {
-        theme::unfocused_border()
-    };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .title(Span::styled(
-            title(guilds, selected_guild_id, loading_bar),
-            theme::title(),
-        ));
+    if area.is_empty() {
+        return;
+    }
+    let block = Block::new()
+        .borders(Borders::RIGHT)
+        .border_style(theme::divider())
+        .title(title_line(guilds, focused, loading_bar, area.width));
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let digest_selected = digest.is_some_and(|d| d.visible || (focused && d.rail_selected));
+    let inner = if digest.is_some() {
+        let [digest_area, rest] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+        let label = if digest_area.width >= 8 {
+            "◆ Digest"
+        } else {
+            " ◆"
+        };
+        let mut row = Paragraph::new(Span::styled(label, theme::attention()));
+        if digest_selected {
+            row = row.style(theme::selected_row(true));
+        }
+        frame.render_widget(row, digest_area);
+        rest
+    } else {
+        inner
+    };
+
+    if guilds.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No servers loaded").style(theme::dim()),
+            inner,
+        );
+        return;
+    }
 
     let collapsed = !focused;
     let show_preview = !collapsed && selected_guild_id.is_some() && inner.height >= 8;
@@ -64,19 +86,12 @@ pub fn render(
         .map(|guild| list_item(guild, list_area.width, collapsed))
         .collect();
 
-    let list = List::new(items)
-        .highlight_style(theme::selected_panel_row())
-        .highlight_symbol(if collapsed { "" } else { "▌" });
+    let mut list = List::new(items);
+    if !digest_selected {
+        list = list.highlight_style(theme::selected_row(focused));
+    }
     frame.render_stateful_widget(list, list_area, state);
 
-    render_row_backgrounds(
-        frame,
-        list_area,
-        guilds,
-        state,
-        selected_guild_id,
-        collapsed,
-    );
     render_guild_avatars(
         frame,
         list_area,
@@ -102,9 +117,7 @@ fn list_item(guild: &GuildSummary, width: u16, collapsed: bool) -> ListItem<'sta
         String::new()
     };
     let name_style = if guild.unread {
-        Style::new()
-            .fg(ratatui::style::Color::White)
-            .add_modifier(Modifier::BOLD)
+        theme::unread_name()
     } else {
         theme::dim()
     };
@@ -120,43 +133,10 @@ fn list_item(guild: &GuildSummary, width: u16, collapsed: bool) -> ListItem<'sta
         ));
     }
     if !unread_suffix.is_empty() {
-        primary.push(Span::styled(unread_suffix, theme::mention()));
+        primary.push(Span::styled(unread_suffix, theme::count()));
     }
 
     ListItem::new(vec![Line::from(""), Line::from(primary), Line::from("")])
-}
-
-fn render_row_backgrounds(
-    frame: &mut Frame,
-    area: Rect,
-    guilds: &[GuildSummary],
-    state: &ListState,
-    selected_guild_id: Option<&str>,
-    collapsed: bool,
-) {
-    for (row_y, guild) in visible_guild_rows(guilds, state, area, collapsed) {
-        if selected_guild_id != Some(guild.id.as_str()) {
-            continue;
-        }
-        let target_rect = if collapsed {
-            collapsed_avatar_cell_rect(area, row_y)
-        } else {
-            Rect {
-                x: area.x,
-                y: row_y,
-                width: area.width,
-                height: EXPANDED_ROW_HEIGHT.min(area.y + area.height - row_y),
-            }
-        };
-        frame.render_widget(
-            Paragraph::new(String::new()).style(if collapsed {
-                theme::selected_avatar_only_row()
-            } else {
-                theme::selected_panel_row()
-            }),
-            target_rect,
-        );
-    }
 }
 
 fn render_guild_avatars(
@@ -170,6 +150,12 @@ fn render_guild_avatars(
 ) {
     for (row_y, guild) in visible_guild_rows(guilds, state, area, collapsed) {
         let is_selected = selected_guild_id == Some(guild.id.as_str());
+        if collapsed && is_selected {
+            frame.render_widget(
+                Paragraph::new("").style(theme::selected_row(false)),
+                collapsed_avatar_cell_rect(area, row_y),
+            );
+        }
         let avatar_rect = if collapsed {
             collapsed_avatar_rect(area, row_y)
         } else {
@@ -185,7 +171,7 @@ fn render_guild_avatars(
             avatar_rect,
             guild.avatar_url.as_deref(),
             &badge_from_name(&guild.name),
-            ratatui::style::Color::Rgb(88, 101, 242),
+            theme::ACCENT,
             tone,
         );
     }
@@ -262,24 +248,23 @@ fn blank_lines(count: u16) -> Vec<Line<'static>> {
     (0..count).map(|_| Line::from("")).collect()
 }
 
-fn title(
+/// "SERVERS n" when there is room; the collapsed avatar rail has no room for a label.
+fn title_line(
     guilds: &[GuildSummary],
-    selected_guild_id: Option<&str>,
+    focused: bool,
     loading_bar: Option<&str>,
-) -> String {
-    match selected_guild_id.and_then(|id| guilds.iter().find(|guild| guild.id == id)) {
-        Some(selected) => format!(
-            " Guilds {} · {}{} ",
-            guilds.len(),
-            truncate_name(&selected.name, 16),
-            loading_bar.map_or_else(String::new, |bar| format!(" {bar}"))
-        ),
-        None => format!(
-            " Guilds {}{} ",
-            guilds.len(),
-            loading_bar.map_or_else(String::new, |bar| format!(" {bar}"))
-        ),
+    width: u16,
+) -> Line<'static> {
+    let label = if width >= 16 {
+        format!(" SERVERS {}", guilds.len())
+    } else {
+        String::new()
+    };
+    let mut spans = vec![Span::styled(label, theme::pane_title(focused))];
+    if let Some(bar) = loading_bar {
+        spans.push(Span::styled(format!(" {bar}"), theme::count()));
     }
+    Line::from(spans)
 }
 
 fn render_selected_guild_preview(
@@ -317,15 +302,15 @@ fn render_selected_guild_preview(
 
 #[cfg(test)]
 mod tests {
-    use super::list_item;
     use crate::model::GuildSummary;
+    use crate::ui::guilds::{collapsed_avatar_rect, expanded_avatar_rect, list_item};
     use crate::ui::truncate_name;
     use ratatui::layout::Rect;
 
     fn guild() -> GuildSummary {
         GuildSummary {
             id: "g1".into(),
-            name: "Hack Different".into(),
+            name: "Rust Lang".into(),
             muted: false,
             unread: false,
             unread_count: 0,
@@ -338,7 +323,7 @@ mod tests {
         let name = "🦀 Rustaceans España";
         let truncated = truncate_name(name, 8);
         assert!(truncated.ends_with('…'));
-        assert!(!truncated.is_empty());
+        assert_ne!(truncated, "");
     }
 
     #[test]
@@ -362,7 +347,7 @@ mod tests {
     #[test]
     fn collapsed_avatar_rect_is_vertically_inset() {
         let area = Rect::new(0, 0, 5, 20);
-        let rect = super::collapsed_avatar_rect(area, 3);
+        let rect = collapsed_avatar_rect(area, 3);
         assert_eq!(rect.x, 0);
         assert_eq!(rect.y, 4);
         assert_eq!(rect.width, 5);
@@ -372,7 +357,7 @@ mod tests {
     #[test]
     fn expanded_avatar_rect_is_wider_than_it_is_tall() {
         let area = Rect::new(0, 0, 18, 12);
-        let rect = super::expanded_avatar_rect(area, 0);
+        let rect = expanded_avatar_rect(area, 0);
         assert!(rect.width > rect.height);
     }
 }

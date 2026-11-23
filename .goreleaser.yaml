@@ -1,0 +1,45 @@
+version: 2
+project_name: disctui
+dist: target/dist
+
+builds:
+  - id: disctui
+    builder: rust
+    command: build
+    binary: disctui
+    targets:
+      - aarch64-apple-darwin
+      - x86_64-apple-darwin
+    flags:
+      - --release
+      - --locked
+      - --features=experimental-discord
+
+archives:
+  - id: disctui
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - LICENSE
+      - README.md
+      - config.toml.example
+
+checksum:
+  name_template: checksums.txt
+
+homebrew_casks:
+  - name: disctui
+    ids:
+      - disctui
+    binaries:
+      - disctui
+    repository:
+      owner: blacktop
+      name: homebrew-tap
+      branch: master
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    directory: Casks
+    skip_upload: auto
+    homepage: https://github.com/blacktop/disctui
+    description: Discord TUI with AI summaries and a headless daily digest
+    license: MIT

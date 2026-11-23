@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use color_eyre::eyre::{Result, eyre};
 use serde::{Deserialize, Serialize};
 
@@ -5,21 +7,27 @@ use crate::ai::Summarizer;
 use crate::ai::prompt;
 use crate::model::{ChannelDigest, MessageRow};
 
-const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
-const DEFAULT_MODEL: &str = "google/gemma-4-26b-a4b";
+pub const DEFAULT_BASE_URL: &str = "http://localhost:1234/v1";
+pub const DEFAULT_MODEL: &str = "google/gemma-4-26b-a4b";
+/// Local models can take minutes on a long conversation.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Summarizer for any OpenAI-compatible chat completions endpoint: LM Studio,
+/// Ollama, llama.cpp, or a hosted provider when an API key is set.
 pub struct LocalSummarizer {
     client: reqwest::Client,
     base_url: String,
     model: String,
+    api_key: Option<String>,
 }
 
 impl LocalSummarizer {
-    pub fn new(base_url: Option<String>, model: Option<String>) -> Self {
+    pub fn new(base_url: String, model: String, api_key: Option<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
-            base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.into()),
-            model: model.unwrap_or_else(|| DEFAULT_MODEL.into()),
+            base_url,
+            model,
+            api_key,
         }
     }
 
@@ -46,26 +54,7 @@ impl LocalSummarizer {
                 "json_schema": {
                     "name": "digest",
                     "strict": false,
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "summary": { "type": "string" },
-                            "action_items": {
-                                "type": "array",
-                                "items": {
-                                    "type": "object",
-                                    "properties": {
-                                        "author": { "type": "string" },
-                                        "snippet": { "type": "string" },
-                                        "reason": { "type": "string" },
-                                        "message_id": { "type": "string" }
-                                    },
-                                    "required": ["author", "snippet", "reason"]
-                                }
-                            }
-                        },
-                        "required": ["summary"]
-                    }
+                    "schema": prompt::digest_json_schema()
                 }
             }),
             reasoning_effort: Some("none".into()),
@@ -122,19 +111,22 @@ impl Summarizer for LocalSummarizer {
         let request = self.build_request(system_prompt, &conversation);
         let url = format!("{}/chat/completions", self.base_url);
 
-        let response = self
+        let mut http_request = self
             .client
             .post(&url)
+            .timeout(REQUEST_TIMEOUT)
             .header("content-type", "application/json")
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| {
-                eyre!(
-                    "local LLM request failed (is LM Studio running at {}?): {e}",
-                    self.base_url
-                )
-            })?;
+            .json(&request);
+        if let Some(api_key) = &self.api_key {
+            http_request = http_request.bearer_auth(api_key);
+        }
+
+        let response = http_request.send().await.map_err(|e| {
+            eyre!(
+                "LLM request failed (is a model server running at {}?): {e}",
+                self.base_url
+            )
+        })?;
 
         let status = response.status();
         let body = response
@@ -196,23 +188,41 @@ struct ChatResponseMessage {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "unwrap is fine in tests")]
 mod tests {
-    use super::*;
+    use crate::ai::local::*;
 
-    #[test]
-    fn default_config() {
-        let s = LocalSummarizer::new(None, None);
-        assert_eq!(s.base_url, "http://localhost:1234/v1");
-        assert_eq!(s.model, "google/gemma-4-26b-a4b");
+    fn summarizer() -> LocalSummarizer {
+        LocalSummarizer::new("http://localhost:11434/v1".into(), "llama3".into(), None)
     }
 
     #[test]
-    fn custom_config() {
-        let s = LocalSummarizer::new(
-            Some("http://localhost:11434/v1".into()),
-            Some("llama3".into()),
+    fn request_uses_the_shared_digest_schema() {
+        let request = summarizer().build_request("system".into(), "alice: hi");
+        let json = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(json["model"], "llama3");
+        assert_eq!(
+            json["response_format"]["json_schema"]["schema"],
+            prompt::digest_json_schema()
         );
-        assert_eq!(s.base_url, "http://localhost:11434/v1");
-        assert_eq!(s.model, "llama3");
+    }
+
+    #[test]
+    fn content_is_preferred_over_reasoning() {
+        let body = r#"{"choices": [{"message": {"content": "{}", "reasoning_content": "hmm"}}]}"#;
+        assert_eq!(LocalSummarizer::extract_text(body).unwrap(), "{}");
+    }
+
+    #[test]
+    fn reasoning_content_is_used_when_content_is_empty() {
+        let body = r#"{"choices": [{"message": {"content": "", "reasoning_content": "{}"}}]}"#;
+        assert_eq!(LocalSummarizer::extract_text(body).unwrap(), "{}");
+    }
+
+    #[test]
+    fn empty_response_is_an_error() {
+        let body = r#"{"choices": []}"#;
+        assert!(LocalSummarizer::extract_text(body).is_err());
     }
 }

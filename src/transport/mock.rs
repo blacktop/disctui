@@ -2,6 +2,9 @@ use crate::model::{
     ChannelKind, ChannelSummary, DIRECT_MESSAGES_GUILD_ID, GuildSummary, MessageRow,
 };
 
+/// The signed-in user in the fixtures; `rust_general_messages` mentions them.
+pub const USER_NAME: &str = "ferris";
+
 /// Load fixture guilds.
 pub fn guilds() -> Vec<GuildSummary> {
     vec![
@@ -259,7 +262,7 @@ fn rust_general_messages() -> Vec<MessageRow> {
             "m12",
             "c1",
             "dave",
-            "@blacktop thoughts on the new edition?",
+            "@ferris thoughts on the new edition?",
             "10:35",
             false,
         ),

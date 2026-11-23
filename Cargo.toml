@@ -3,10 +3,9 @@ name = "disctui"
 version = "0.1.5"
 edition = "2024"
 authors = ["blacktop"]
-description = "A fast, minimal Discord TUI with AI-powered conversation summaries"
+description = "Discord TUI with AI summaries and a headless daily digest"
 license = "MIT"
 repository = "https://github.com/blacktop/disctui"
-homepage = "https://github.com/blacktop/disctui"
 
 [dependencies]
 ratatui = "0.30"
@@ -26,9 +25,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 unicode-width = "0.2"
 libc = "0.2"
 rusqlite = { version = "0.39", features = ["bundled"] }
-ratatui-image = { version = "10.0", default-features = false, features = ["crossterm", "image-defaults"] }
+ratatui-image = { version = "=11.1.0", default-features = false, features = ["crossterm", "image-defaults"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 textwrap = "0.16"
+base64 = "0.22"
 
 # AI summarization
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
@@ -37,11 +37,32 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 diself = { version = "0.3", optional = true }
 async-trait = { version = "0.1", optional = true }
 keyring = { version = "3.6", optional = true, features = ["apple-native"] }
-zeroize = { version = "1.8", features = ["derive"], optional = true }
+zeroize = { version = "1", features = ["derive"], optional = true }
+# Browser authorization (PKCE). Already built by rustls.
+aws-lc-rs = { version = "1", optional = true, default-features = false, features = ["aws-lc-sys"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "=3.7.0", optional = true }
+objc2 = { version = "=0.6.5", optional = true }
+objc2-app-kit = { version = "=0.3.2", optional = true, default-features = false, features = ["NSScreen"] }
+tao = { version = "=0.35.3", optional = true }
+wry = { version = "=0.57.2", optional = true, default-features = false, features = ["os-webview"] }
 
 [features]
 default = []
-experimental-discord = ["dep:diself", "dep:async-trait", "dep:keyring", "dep:zeroize"]
+experimental-discord = [
+    "dep:diself",
+    "dep:security-framework",
+    "dep:tao",
+    "dep:objc2",
+    "dep:objc2-app-kit",
+    "dep:wry",
+    "dep:async-trait",
+    "dep:keyring",
+    "reqwest/form",
+    "dep:zeroize",
+    "dep:aws-lc-rs",
+]
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
@@ -68,7 +89,5 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
-# The profile that 'dist' will build with
-[profile.dist]
-inherits = "release"
-lto = "thin"
+[patch.crates-io]
+diself = { path = "vendor/diself" }

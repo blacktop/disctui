@@ -1,3 +1,6 @@
+use std::time::Instant;
+
+use crate::digest::PreparedDigest;
 use crate::model::MessageRow;
 
 #[derive(Debug, Clone)]
@@ -19,6 +22,10 @@ pub enum Effect {
         channel_name: String,
         messages: Vec<MessageRow>,
         user_name: String,
+    },
+    GenerateDigest {
+        job: Instant,
+        request: PreparedDigest,
     },
     FetchAvatar {
         url: String,

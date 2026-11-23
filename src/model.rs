@@ -24,9 +24,19 @@ impl ChannelKind {
             Self::DirectMessage => "@",
         }
     }
+
+    /// The name scripts see for this kind in JSON output.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Category => "category",
+            Self::Text => "text",
+            Self::Announcement => "announcement",
+            Self::DirectMessage => "dm",
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuildSummary {
     pub id: String,
     pub name: String,
@@ -183,6 +193,8 @@ pub struct MessageRow {
 #[derive(Debug, Clone)]
 pub struct ChannelDigest {
     pub channel_id: String,
+    /// One line for list views, e.g. the daily digest.
+    pub headline: String,
     pub summary: String,
     pub todos: Vec<TodoItem>,
     pub generated_at: String,
