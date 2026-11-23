@@ -138,3 +138,43 @@ release version:
         exit 1
     fi
     printf 'Pushed %s; GitHub Actions will publish the release and Homebrew cask.\n' "$dt_tag"
+
+# Bump the version (patch, minor, or major), commit, push, and release it: just bump minor.
+bump level="patch":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dt_level="$1"
+    if [[ "$(git branch --show-current)" != main || -n "$(git status --porcelain)" ]]; then
+        printf 'Bump requires a clean main checkout\n' >&2
+        exit 1
+    fi
+    dt_current=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+    if [[ ! "$dt_current" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+        printf 'Cannot bump %q; expected MAJOR.MINOR.PATCH in Cargo.toml\n' "$dt_current" >&2
+        exit 1
+    fi
+    dt_major=${BASH_REMATCH[1]} dt_minor=${BASH_REMATCH[2]} dt_patch=${BASH_REMATCH[3]}
+    case "$dt_level" in
+        patch) dt_patch=$((dt_patch + 1)) ;;
+        minor) dt_minor=$((dt_minor + 1)) dt_patch=0 ;;
+        major) dt_major=$((dt_major + 1)) dt_minor=0 dt_patch=0 ;;
+        *)
+            printf 'Bump level must be patch, minor, or major, not %q\n' "$dt_level" >&2
+            exit 1
+            ;;
+    esac
+    dt_next="$dt_major.$dt_minor.$dt_patch"
+    dt_ref="refs/tags/v$dt_next"
+    if git show-ref --verify --quiet "$dt_ref" || [[ -n "$(git ls-remote --tags origin "$dt_ref")" ]]; then
+        printf 'Tag v%s already exists\n' "$dt_next" >&2
+        exit 1
+    fi
+    # Fail before anything is committed or pushed.
+    just check
+    dt_current="$dt_current" dt_next="$dt_next" perl -pi -e \
+        '$done ||= s/^version = "\Q$ENV{dt_current}\E"$/version = "$ENV{dt_next}"/' Cargo.toml
+    cargo update --workspace
+    just check-version "v$dt_next"
+    git commit --quiet -m "chore: Release disctui version $dt_next" Cargo.toml Cargo.lock
+    git push origin main
+    just release "v$dt_next"

@@ -70,7 +70,8 @@ just build            # release binary with Discord support
 just check            # fmt, clippy, and tests for both feature sets
 just run digest --mock --no-ai
 just package          # local release archives, nothing published
-just release v0.2.0   # check, sign the tag, and push it
+just bump             # bump the patch version, commit, push, and release
+just release v0.2.0   # release the version already in Cargo.toml
 ```
 
 Pushing a signed `vX.Y.Z` tag runs the release workflow, which builds both macOS architectures with GoReleaser and updates the Homebrew cask.
