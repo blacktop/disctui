@@ -40,6 +40,13 @@ homebrew_casks:
       token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
     directory: Casks
     skip_upload: auto
+    # The binary is not notarized, so clear the quarantine flag Homebrew sets.
+    hooks:
+      post:
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/disctui"]
+          end
     homepage: https://github.com/blacktop/disctui
     description: Discord TUI with AI summaries and a headless daily digest
     license: MIT
