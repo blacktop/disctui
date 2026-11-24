@@ -192,6 +192,8 @@ just install-rex    # or build and install disctui first
 
 The script writes the actions file beside Rex's `init.lua`, loads it from there, and reloads Rex. It points the actions at the disctui it found, so they work when Rex's PATH differs from your shell's. Run it again after upgrading disctui.
 
+The Homebrew cask does the upgrade half for you. When `~/.config/rex` exists, every `brew install` and `brew upgrade` rewrites `~/.config/rex/disctui.lua` for the new release. Homebrew's sandbox cannot reach Rex, so run `rex config reload` afterwards. The cask never edits `init.lua`; add the load line below once.
+
 To do the same by hand:
 
 ```sh

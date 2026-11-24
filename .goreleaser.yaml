@@ -41,12 +41,28 @@ homebrew_casks:
     directory: Casks
     skip_upload: auto
     # The binary is not notarized, so clear the quarantine flag Homebrew sets.
+    # Then, for Rex users, write the palette actions that match this release.
+    # Homebrew runs these steps in a sandbox that hides the home directory and
+    # the network, so rex/install.sh cannot run here: nothing can call `rex`.
     hooks:
       post:
         install_steps: |
           on_macos do
             run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/disctui"]
           end
+          if_path_exists ".config/rex", base: :home do
+            run "{{ .StagedPath }}/disctui", args: ["rex"], stdout_path: "rex-actions.lua"
+            inreplace "rex-actions.lua", /^local BIN = .*$/,
+                      'local BIN = os.getenv("DISCTUI_BIN") or "{{ "{{HOMEBREW_PREFIX}}" }}/bin/disctui"',
+                      audit_result: false
+            copy "rex-actions.lua", ".config/rex/disctui.lua", target_base: :home
+          end
+    caveats: |
+      Rex users: the command palette actions are in ~/.config/rex/disctui.lua,
+      and every upgrade rewrites them. Load them once by adding this line to
+      ~/.config/rex/init.lua:
+        dofile(os.getenv("HOME") .. "/.config/rex/disctui.lua")
+      Then run `rex config reload`, and again after each upgrade.
     homepage: https://github.com/blacktop/disctui
     description: Discord TUI with AI summaries and a headless daily digest
     license: MIT
