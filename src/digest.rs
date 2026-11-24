@@ -1007,13 +1007,65 @@ fn write_markdown_items(out: &mut String, title: &str, items: &[NeedsYou]) {
         let who = format!("{} {}", item.author, item.time);
         let _ = writeln!(
             out,
-            "- **{} {}**, {}: \"{}\" ({})",
+            "- **{} {}** \u{b7} {} \u{b7} {}",
             terminal_field(&item.guild),
             terminal_field(&item.channel),
             terminal_field(who.trim()),
-            terminal_field(&item.snippet),
             terminal_field(&item.reason)
         );
+        let quote = terminal_field(&item.snippet);
+        if !quote.trim().is_empty() {
+            let _ = writeln!(out, "  > {}", quote.trim());
+        }
+    }
+}
+
+/// One section per server, with a heading per channel so a long digest can be skimmed.
+fn write_markdown_server(out: &mut String, server: &ServerDigest) {
+    let _ = writeln!(
+        out,
+        "\n## {} \u{b7} {}",
+        terminal_field(&server.name),
+        plural(server.messages, "message")
+    );
+    let summarized = server.channels.iter().any(|channel| {
+        channel.headline.is_some() || channel.summary.is_some() || channel.error.is_some()
+    });
+    if !summarized {
+        // Without summaries a heading per channel would have nothing under it.
+        out.push('\n');
+        for channel in &server.channels {
+            let _ = writeln!(
+                out,
+                "- **{}** \u{b7} {}",
+                terminal_field(&channel.name),
+                plural(channel.messages, "message")
+            );
+        }
+        return;
+    }
+    for channel in &server.channels {
+        let _ = writeln!(
+            out,
+            "\n### {} \u{b7} {}",
+            terminal_field(&channel.name),
+            plural(channel.messages, "message")
+        );
+        match (&channel.headline, &channel.error) {
+            (Some(headline), Some(_) | None) => {
+                let headline = terminal_field(headline);
+                if !headline.trim().is_empty() {
+                    let _ = writeln!(out, "\n**{}**", headline.trim());
+                }
+            }
+            (None, Some(error)) => {
+                let _ = writeln!(out, "\n*{}*", terminal_field(error).trim());
+            }
+            (None, None) => {}
+        }
+        if let Some(summary) = &channel.summary {
+            let _ = writeln!(out, "\n{}", terminal_field(summary).trim());
+        }
     }
 }
 
@@ -1029,13 +1081,9 @@ pub fn render_markdown(report: &DigestReport) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "# Discord digest: {} ({})",
-        terminal_field(&report.generated_at),
-        terminal_field(&report.window)
+        "# Discord digest: {}",
+        terminal_field(&report.generated_at)
     );
-    if let Some(model) = &report.model {
-        let _ = writeln!(out, "\nSummaries by {}.", terminal_field(model));
-    }
 
     if report.servers.is_empty() {
         let _ = writeln!(
@@ -1046,31 +1094,26 @@ pub fn render_markdown(report: &DigestReport) -> String {
         return out;
     }
 
+    let messages = report.servers.iter().map(|server| server.messages).sum();
+    let _ = write!(
+        out,
+        "\n{} in {} across {} over the {}.",
+        plural(messages, "message"),
+        plural(report.channel_count(), "channel"),
+        plural(report.servers.len(), "server"),
+        terminal_field(&report.window)
+    );
+    if let Some(model) = &report.model {
+        let _ = write!(out, " Summaries by {}.", terminal_field(model));
+    }
+    out.push('\n');
+
     let (mentions, others) = report.mentions_and_others();
     write_markdown_items(&mut out, "Mentions", mentions);
     write_markdown_items(&mut out, "Needs you", others);
 
-    let _ = writeln!(out, "\n## Top channels");
     for server in &report.servers {
-        let _ = writeln!(
-            out,
-            "\n### {} ({})\n",
-            terminal_field(&server.name),
-            plural(server.messages, "message")
-        );
-        for channel in &server.channels {
-            let headline = channel.headline_or_error().unwrap_or("not summarized");
-            let _ = writeln!(
-                out,
-                "- **{}** ({}): {}",
-                terminal_field(&channel.name),
-                channel.messages,
-                terminal_field(headline)
-            );
-            if let Some(summary) = &channel.summary {
-                let _ = writeln!(out, "  {}", terminal_field(summary));
-            }
-        }
+        write_markdown_server(&mut out, server);
     }
 
     if !report.quiet.is_empty() {
@@ -1746,11 +1789,43 @@ mod tests {
     #[test]
     fn markdown_rendering_lists_needs_you_and_channels() {
         let markdown = render_markdown(&sample_report());
-        assert!(markdown.starts_with("# Discord digest: Sat Nov 21 (last 24h)\n"));
-        assert!(markdown.contains("## Mentions\n\n- **Rust Lang #general**, dave 10:35:"));
+        assert!(markdown.starts_with(
+            "# Discord digest: Sat Nov 21\n\n\
+             1 message in 1 channel across 1 server over the last 24h.\n"
+        ));
+        assert!(markdown.contains(
+            "## Mentions\n\n- **Rust Lang #general** \u{b7} dave 10:35 \u{b7} Mentions you\n  \
+             > @ferris thoughts on the new edition?\n"
+        ));
         assert!(!markdown.contains("## Needs you"));
-        assert!(markdown.contains("### Rust Lang (1 message)"));
-        assert!(markdown.contains("## Quiet\n\nratatui"));
+        assert!(markdown.contains(
+            "\n## Rust Lang \u{b7} 1 message\n\n### #general \u{b7} 1 message\n\n\
+             *summary failed: timeout*\n"
+        ));
+        assert!(markdown.ends_with("\n## Quiet\n\nratatui\n"));
+    }
+
+    #[test]
+    fn markdown_gives_each_summarized_channel_a_headline_and_a_paragraph() {
+        let mut report = sample_report();
+        report.model = Some("test-model".into());
+        let channel = &mut report.servers[0].channels[0];
+        channel.error = None;
+        channel.headline = Some("New edition lands".into());
+        channel.summary = Some("The team shipped it.\nFeedback is open.".into());
+        let markdown = render_markdown(&report);
+        assert!(markdown.contains("over the last 24h. Summaries by test-model.\n"));
+        assert!(markdown.contains(
+            "### #general \u{b7} 1 message\n\n**New edition lands**\n\n\
+             The team shipped it. Feedback is open.\n"
+        ));
+
+        let channel = &mut report.servers[0].channels[0];
+        channel.headline = None;
+        channel.summary = None;
+        assert!(render_markdown(&report).contains(
+            "## Rust Lang \u{b7} 1 message\n\n- **#general** \u{b7} 1 message\n\n## Quiet"
+        ));
     }
 
     #[test]

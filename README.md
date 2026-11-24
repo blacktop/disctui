@@ -130,7 +130,7 @@ In the TUI, press `1`, then `g` and Enter to open **◆ Digest** at the top of t
 ```sh
 disctui digest                          # last 24 hours, every server
 disctui digest --since 3d --guild rust  # only servers whose name contains "rust"
-disctui digest --format md --out ~/digests/today.md
+disctui digest --out ~/digests/today.md # Markdown, from the extension
 disctui digest --format json | jq '.needs_you'
 ```
 
@@ -148,7 +148,15 @@ A channel named this way is fetched even when muted. A server channel with unrea
 
 `--no-ai` skips the summaries and still ranks channels and flags mentions. `--mock` runs against built-in sample data, which is a quick way to see the output.
 
-To get a digest every morning, run it from `cron` or a `launchd` agent with `--out`. It reads the token the same way the TUI does: `DISCTUI_TOKEN` first, then the Keychain.
+Without `--out`, the digest prints to the terminal and nothing is saved. To save every run, name the file in the config:
+
+```toml
+digest_out = "~/digests/today.md"
+```
+
+The extension picks the format: `.md` for Markdown, `.json` for JSON, anything else for text. `--format` overrides that, `--out FILE` writes somewhere else for one run, and `--out -` prints to the terminal. Each run replaces the file. `--mock` never writes to the configured file.
+
+To get a digest every morning, run it from `cron` or a `launchd` agent with `digest_out` set or `--out`. It reads the token the same way the TUI does: `DISCTUI_TOKEN` first, then the Keychain.
 
 ## AI backends
 
@@ -235,6 +243,8 @@ Config keys:
 - `ai_base_url`
 - `ai_model`
 - `ai_api_key`
+- `digest_include`
+- `digest_out`
 
 Any key can also be set from the environment with a `DISCTUI_` prefix, for example `DISCTUI_AI_BACKEND=local`. For a digest list, separate entries with commas, as in `DISCTUI_DIGEST_INCLUDE="Rust Lang,Tokio #announcements"`.
 

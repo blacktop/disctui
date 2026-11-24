@@ -2,6 +2,7 @@
 
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 
 use color_eyre::eyre::{Result, WrapErr, eyre};
 use serde::Serialize;
@@ -275,6 +276,43 @@ mod live {
     }
 }
 
+/// Where a digest goes.
+#[derive(Debug, PartialEq, Eq)]
+enum Destination {
+    Stdout,
+    File(PathBuf),
+}
+
+impl Destination {
+    /// `--out` wins over the configured file, and `-` prints either way.
+    fn resolve(flag: Option<PathBuf>, configured: Option<PathBuf>) -> Self {
+        let Some(path) = flag.or(configured) else {
+            return Self::Stdout;
+        };
+        if path.as_os_str() == "-" {
+            Self::Stdout
+        } else {
+            Self::File(path)
+        }
+    }
+
+    /// `--format` wins; otherwise a file's extension picks Markdown or JSON.
+    fn format(&self, flag: Option<DigestFormat>) -> DigestFormat {
+        if let Some(format) = flag {
+            return format;
+        }
+        let extension = match self {
+            Self::Stdout => None,
+            Self::File(path) => path.extension().and_then(|ext| ext.to_str()),
+        };
+        match extension {
+            Some("md" | "markdown") => DigestFormat::Md,
+            Some("json") => DigestFormat::Json,
+            Some(_) | None => DigestFormat::Text,
+        }
+    }
+}
+
 fn render(report: &DigestReport, format: DigestFormat, color: bool) -> Result<String> {
     Ok(match format {
         DigestFormat::Text => digest::render_text(report, color),
@@ -374,9 +412,13 @@ async fn digest_command(
 
     let outcome = outcome_line(&report);
 
-    match args.out {
-        Some(path) => {
-            let rendered = render(&report, args.format, false)?;
+    // Sample data never replaces a saved report.
+    let configured = if args.mock { None } else { config.digest_out() };
+    let destination = Destination::resolve(args.out, configured);
+    let format = destination.format(args.format);
+    match destination {
+        Destination::File(path) => {
+            let rendered = render(&report, format, false)?;
             if let Some(parent) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
                 std::fs::create_dir_all(parent)
                     .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
@@ -388,7 +430,7 @@ async fn digest_command(
                 digest::terminal_field(&path.to_string_lossy())
             ))?;
         }
-        None => write_stdout(&render(&report, args.format, color_enabled())?)?,
+        Destination::Stdout => write_stdout(&render(&report, format, color_enabled())?)?,
     }
     Ok(outcome)
 }
@@ -618,6 +660,40 @@ mod tests {
     }
 
     #[test]
+    fn digest_goes_to_the_flag_then_the_config_then_stdout() {
+        let file = |path: &str| Some(PathBuf::from(path));
+
+        assert_eq!(Destination::resolve(None, None), Destination::Stdout);
+        assert_eq!(
+            Destination::resolve(None, file("saved.md")),
+            Destination::File("saved.md".into())
+        );
+        assert_eq!(
+            Destination::resolve(file("once.md"), file("saved.md")),
+            Destination::File("once.md".into())
+        );
+        assert_eq!(
+            Destination::resolve(file("-"), file("saved.md")),
+            Destination::Stdout
+        );
+    }
+
+    #[test]
+    fn digest_format_follows_the_flag_then_the_file_extension() {
+        let format = |path: &str, flag| Destination::File(path.into()).format(flag);
+
+        assert_eq!(format("today.md", None), DigestFormat::Md);
+        assert_eq!(format("today.json", None), DigestFormat::Json);
+        assert_eq!(format("today.txt", None), DigestFormat::Text);
+        assert_eq!(format("today", None), DigestFormat::Text);
+        assert_eq!(
+            format("today.md", Some(DigestFormat::Json)),
+            DigestFormat::Json
+        );
+        assert_eq!(Destination::Stdout.format(None), DigestFormat::Text);
+    }
+
+    #[test]
     fn rex_actions_call_subcommands_and_flags_that_exist() {
         use clap::Parser;
 
@@ -630,11 +706,12 @@ mod tests {
         for argv in [
             vec!["disctui", "channels", "--format", "json", "--mock"],
             vec![
-                "disctui", "digest", "--no-ai", "--format", "json", "--since", "24h", "--limit",
-                "10",
+                "disctui", "digest", "--no-ai", "--format", "json", "--out", "-", "--since", "24h",
+                "--limit", "10",
             ],
             vec![
-                "disctui", "digest", "--since", "24h", "--guild", "@me", "--guild", "g1",
+                "disctui", "digest", "--out", "-", "--since", "24h", "--guild", "@me", "--guild",
+                "g1",
             ],
             vec!["disctui", "open", "123"],
             vec!["disctui", "--open", "123"],

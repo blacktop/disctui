@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use color_eyre::eyre::{Result, WrapErr};
@@ -24,6 +24,8 @@ pub struct AppConfig {
     /// Digest whitelist: `Server`, or `Server #channel` for one channel.
     /// Empty means every server.
     pub digest_include: Vec<String>,
+    /// File `disctui digest` writes when `--out` is not given.
+    pub digest_out: Option<PathBuf>,
 }
 
 impl Default for AppConfig {
@@ -36,6 +38,7 @@ impl Default for AppConfig {
             ai_model: None,
             ai_api_key: None,
             digest_include: Vec::new(),
+            digest_out: None,
         }
     }
 }
@@ -93,6 +96,15 @@ impl AppConfig {
             .iter()
             .filter_map(|entry| Include::parse(entry))
             .collect()
+    }
+
+    /// The configured digest file, with a leading `~` expanded to the home directory.
+    pub fn digest_out(&self) -> Option<PathBuf> {
+        let path = self.digest_out.as_deref()?;
+        if path.as_os_str().is_empty() {
+            return None;
+        }
+        Some(expand_home(path, dirs::home_dir().as_deref()))
     }
 
     pub fn tick_rate(&self) -> Duration {
@@ -153,6 +165,14 @@ impl AppConfig {
     }
 }
 
+/// The shell expands `~` on the command line; nothing does for a config value.
+fn expand_home(path: &Path, home: Option<&Path>) -> PathBuf {
+    let (Ok(rest), Some(home)) = (path.strip_prefix("~"), home) else {
+        return path.to_path_buf();
+    };
+    home.join(rest)
+}
+
 fn anthropic_api_key() -> Option<String> {
     std::env::var("ANTHROPIC_API_KEY")
         .ok()
@@ -177,6 +197,49 @@ mod tests {
             cfg.digest_include(),
             Vec::from_iter(Include::parse("tokio #changelog"))
         );
+    }
+
+    #[test]
+    fn digest_out_is_unset_by_default_and_ignores_an_empty_path() {
+        let mut cfg = AppConfig::default();
+        assert_eq!(cfg.digest_out(), None);
+
+        cfg.digest_out = Some(PathBuf::new());
+        assert_eq!(cfg.digest_out(), None);
+
+        cfg.digest_out = Some("/tmp/digests/today.md".into());
+        assert_eq!(
+            cfg.digest_out(),
+            Some(PathBuf::from("/tmp/digests/today.md"))
+        );
+    }
+
+    #[test]
+    fn digest_out_is_read_from_the_config_file() {
+        let source = config::File::from_str(
+            "digest_out = \"~/digests/today.md\"",
+            config::FileFormat::Toml,
+        );
+        let cfg: AppConfig = config::Config::builder()
+            .add_source(source)
+            .build()
+            .and_then(config::Config::try_deserialize)
+            .unwrap_or_else(|err| panic!("config should load: {err}"));
+        assert_eq!(cfg.digest_out, Some(PathBuf::from("~/digests/today.md")));
+    }
+
+    #[test]
+    fn only_a_leading_tilde_of_its_own_expands_to_home() {
+        let home = Some(Path::new("/Users/me"));
+        let expand = |path: &str, home| expand_home(Path::new(path), home);
+
+        assert_eq!(
+            expand("~/digests/today.md", home),
+            PathBuf::from("/Users/me/digests/today.md")
+        );
+        assert_eq!(expand("/tmp/a.md", home), PathBuf::from("/tmp/a.md"));
+        assert_eq!(expand("~other/a.md", home), PathBuf::from("~other/a.md"));
+        assert_eq!(expand("~/a.md", None), PathBuf::from("~/a.md"));
     }
 
     fn config(backend: &str) -> AppConfig {

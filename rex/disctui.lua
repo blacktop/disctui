@@ -212,7 +212,8 @@ rex.action({
     local report = args.prepared
     if report == nil then
       return load_in_split(ctx, "disctui_inbox", args, disctui_argv(
-        args.mock, "digest", "--no-ai", "--format", "json", "--since", args.since or "24h", "--limit", "10"
+        args.mock, "digest", "--no-ai", "--format", "json", "--out", "-",
+        "--since", args.since or "24h", "--limit", "10"
       ))
     end
 
@@ -297,7 +298,8 @@ rex.action({
       end
     end
 
-    local command = disctui_argv(args.mock, "digest", "--since", args.since or "24h")
+    -- "--out -" prints the digest here even when the config saves it to a file.
+    local command = disctui_argv(args.mock, "digest", "--out", "-", "--since", args.since or "24h")
     for _, guild in ipairs(guilds) do
       command[#command + 1] = "--guild"
       command[#command + 1] = guild

@@ -38,3 +38,8 @@ ai_backend = "auto"
 # Empty or unset means every server. A channel with unread mentions of you is
 # always included, and `disctui digest --guild` replaces this list for one run.
 # digest_include = ["Rust Lang", "Tokio #announcements"]
+
+# Save `disctui digest` to this file instead of printing it. A leading ~ is your
+# home directory. The format follows the extension: .md, .json, otherwise text.
+# `--out FILE` overrides it for one run, and `--out -` prints to the terminal.
+# digest_out = "~/digests/today.md"

@@ -56,9 +56,9 @@ pub struct DigestArgs {
     #[arg(long, default_value = "24h", value_parser = digest::parse_window)]
     pub since: Duration,
 
-    /// Output format
-    #[arg(long, value_enum, default_value_t = DigestFormat::Text)]
-    pub format: DigestFormat,
+    /// Output format [default: text, or md/json when the output file ends in .md/.json]
+    #[arg(long, value_enum)]
+    pub format: Option<DigestFormat>,
 
     /// Only include servers whose name contains this text, or whose id matches
     /// (repeatable)
@@ -73,7 +73,8 @@ pub struct DigestArgs {
     #[arg(long, default_value_t = digest::DEFAULT_LIMIT)]
     pub limit: usize,
 
-    /// Write the digest to this file instead of stdout
+    /// Write the digest to this file instead of stdout; `-` prints it even when
+    /// the config sets `digest_out`
     #[arg(long, value_name = "FILE")]
     pub out: Option<PathBuf>,
 
@@ -129,7 +130,7 @@ mod tests {
             unreachable!("digest subcommand should parse");
         };
         assert_eq!(args.since, Duration::from_hours(24));
-        assert_eq!(args.format, DigestFormat::Text);
+        assert_eq!(args.format, None);
         assert_eq!((args.top, args.limit), (3, 15));
         assert!(!args.no_ai);
     }
@@ -145,7 +146,7 @@ mod tests {
             unreachable!("digest subcommand should parse");
         };
         assert_eq!(args.since, Duration::from_hours(12));
-        assert_eq!(args.format, DigestFormat::Json);
+        assert_eq!(args.format, Some(DigestFormat::Json));
         assert_eq!(args.guilds, vec!["Tokio", "rust"]);
         assert!(cli.debug);
     }
