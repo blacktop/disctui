@@ -1,6 +1,6 @@
 [package]
 name = "disctui"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 authors = ["blacktop"]
 description = "Discord TUI with AI summaries and a headless daily digest"
