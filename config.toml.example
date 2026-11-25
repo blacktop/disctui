@@ -11,8 +11,8 @@
 # UI tick cadence in milliseconds.
 tick_rate_ms = 250
 
-# Enable mouse support in the TUI.
-mouse = false
+# Set to false to use the terminal's own mouse selection.
+mouse = true
 
 # AI summary backend:
 #   auto   = prefer Anthropic env var, otherwise configured local endpoint

@@ -32,7 +32,7 @@ impl Default for AppConfig {
     fn default() -> Self {
         Self {
             tick_rate_ms: 250,
-            mouse: false,
+            mouse: true,
             ai_backend: "auto".into(),
             ai_base_url: None,
             ai_model: None,

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -8,22 +8,10 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{Resize, StatefulImage};
 
-#[derive(Debug, Clone, Copy)]
-pub enum ImageSupport {
-    Detected(ProtocolType),
-    FallbackHalfblocks,
-}
+use crate::avatar_cache::{self, AvatarCache};
 
-impl ImageSupport {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Detected(ProtocolType::Kitty) => "kitty",
-            Self::Detected(ProtocolType::Sixel) => "sixel",
-            Self::Detected(ProtocolType::Iterm2) => "iterm2",
-            Self::Detected(ProtocolType::Halfblocks) | Self::FallbackHalfblocks => "halfblocks",
-        }
-    }
-}
+const MAX_AVATAR_DOWNLOADS: usize = 8;
+const MAX_QUEUED_AVATARS: usize = 1024;
 
 #[expect(
     clippy::large_enum_variant,
@@ -45,73 +33,111 @@ pub enum AvatarTone {
 }
 
 pub struct AvatarStore {
-    support: ImageSupport,
     picker: Picker,
     cache: HashMap<String, AvatarStatus>,
-    inflight: HashSet<String>,
+    disk: Option<AvatarCache>,
+    queued: VecDeque<String>,
+    active_downloads: usize,
 }
 
 impl AvatarStore {
     pub fn detect() -> Self {
-        match Picker::from_query_stdio() {
-            Ok(mut picker) => {
-                let protocol = picker.protocol_type();
-                picker.set_protocol_type(protocol);
-                Self {
-                    support: ImageSupport::Detected(protocol),
-                    picker,
-                    cache: HashMap::new(),
-                    inflight: HashSet::new(),
-                }
-            }
-            Err(_) => Self::fallback(),
+        let mut store = Self::fallback();
+        if let Ok(picker) = Picker::from_query_stdio() {
+            store.picker = picker;
         }
+        store.disk = AvatarCache::open_default();
+        store
     }
 
     pub fn fallback() -> Self {
-        let picker = Picker::halfblocks();
         Self {
-            support: ImageSupport::FallbackHalfblocks,
-            picker,
+            picker: Picker::halfblocks(),
             cache: HashMap::new(),
-            inflight: HashSet::new(),
+            disk: None,
+            queued: VecDeque::new(),
+            active_downloads: 0,
         }
     }
 
     pub fn protocol_label(&self) -> &'static str {
-        self.support.label()
+        match self.picker.protocol_type() {
+            ProtocolType::Kitty => "kitty",
+            ProtocolType::Sixel => "sixel",
+            ProtocolType::Iterm2 => "iterm2",
+            ProtocolType::Halfblocks => "halfblocks",
+        }
     }
 
+    /// Return true when a download should start immediately.
     pub fn request(&mut self, url: &str) -> bool {
-        if self.cache.contains_key(url) || !self.inflight.insert(url.to_string()) {
+        if self.cache.contains_key(url) {
             return false;
         }
+        let Some(key) = avatar_cache::key(url) else {
+            self.cache.insert(url.to_string(), AvatarStatus::Pending);
+            return true;
+        };
+        if let Some(image) = self.disk.as_ref().and_then(|disk| disk.get(key)) {
+            self.store_image(url.to_string(), image);
+            return false;
+        }
+        if self.active_downloads >= MAX_AVATAR_DOWNLOADS {
+            if self.queued.len() < MAX_QUEUED_AVATARS {
+                self.cache.insert(url.to_string(), AvatarStatus::Pending);
+                self.queued.push_back(url.to_string());
+            }
+            return false;
+        }
+        self.active_downloads += 1;
         self.cache.insert(url.to_string(), AvatarStatus::Pending);
         true
     }
 
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "avatar bytes arrive owned from async action payloads"
-    )]
-    pub fn store_bytes(&mut self, url: String, bytes: Vec<u8>) {
-        self.inflight.remove(&url);
-        match image::load_from_memory(&bytes) {
-            Ok(image) => {
-                let muted_image = image.grayscale();
-                let color = self.picker.new_resize_protocol(image);
-                let muted = self.picker.new_resize_protocol(muted_image);
-                self.cache.insert(url, AvatarStatus::Ready { color, muted });
+    pub fn finish_request(&mut self, url: String, bytes: Option<&[u8]>) -> Option<String> {
+        let key = avatar_cache::key(&url);
+        let is_avatar = key.is_some();
+        let image = bytes.and_then(|bytes| {
+            let Some(key) = key else {
+                return image::load_from_memory(bytes).ok();
+            };
+            let image = avatar_cache::decode_cached(bytes)?;
+            if let Some(disk) = &mut self.disk
+                && let Err(err) = disk.put(key, bytes)
+            {
+                tracing::debug!("could not save avatar to cache: {err}");
             }
-            Err(_) => {
-                self.cache.insert(url, AvatarStatus::Failed);
-            }
+            Some(image)
+        });
+        if let Some(image) = image {
+            self.store_image(url, image);
+        } else {
+            self.cache.insert(url, AvatarStatus::Failed);
         }
+        if !is_avatar {
+            return None;
+        }
+        let next = self.queued.pop_front();
+        if next.is_none() {
+            self.active_downloads = self.active_downloads.saturating_sub(1);
+        }
+        next
     }
 
-    pub fn mark_failed(&mut self, url: String) {
-        self.inflight.remove(&url);
-        self.cache.insert(url, AvatarStatus::Failed);
+    pub fn prioritize_queued<'a>(&mut self, urls: impl IntoIterator<Item = &'a str>) {
+        if self.queued.len() < 2 {
+            return;
+        }
+        let current: HashSet<_> = urls.into_iter().collect();
+        self.queued
+            .make_contiguous()
+            .sort_by_key(|url| !current.contains(url.as_str()));
+    }
+
+    fn store_image(&mut self, url: String, image: image::DynamicImage) {
+        let muted = self.picker.new_resize_protocol(image.grayscale());
+        let color = self.picker.new_resize_protocol(image);
+        self.cache.insert(url, AvatarStatus::Ready { color, muted });
     }
 
     pub fn render_avatar(
@@ -144,10 +170,10 @@ impl AvatarStore {
                     protocol,
                 );
             }
-            Some(AvatarStatus::Pending) => {
+            Some(AvatarStatus::Pending) if avatar_cache::key(url).is_none() => {
                 render_fallback(frame, area, "··", fallback_color, tone);
             }
-            Some(AvatarStatus::Failed) | None => {
+            Some(AvatarStatus::Pending | AvatarStatus::Failed) | None => {
                 render_fallback(frame, area, fallback_label, fallback_color, tone);
             }
         }
@@ -224,5 +250,62 @@ pub fn badge_from_name(name: &str) -> String {
         "??".to_string()
     } else {
         badge
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::unwrap_used,
+    reason = "test cache and fixtures must initialize"
+)]
+mod tests {
+    use std::io::Cursor;
+
+    use crate::ui::media::{AvatarCache, AvatarStatus, AvatarStore, MAX_AVATAR_DOWNLOADS};
+
+    #[test]
+    fn saved_avatar_is_ready_without_a_download_after_reopen() {
+        let dir = std::env::temp_dir().join(format!("disctui-avatar-test-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let cleanup = std::mem::DropGuard::new(dir.clone(), |dir| {
+            let _ = std::fs::remove_dir_all(dir);
+        });
+        let mut store = AvatarStore::fallback();
+        store.disk = Some(AvatarCache::open(&dir).unwrap());
+        let url = "https://cdn.discordapp.com/avatars/123/abcd.png?size=64";
+        let mut source = Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(64, 64)
+            .write_to(&mut source, image::ImageFormat::Png)
+            .unwrap();
+        let png = crate::avatar_cache::normalize(&source.into_inner()).unwrap();
+        assert!(store.request(url));
+        assert!(store.finish_request(url.to_string(), Some(&png)).is_none());
+        drop(store);
+
+        let mut store = AvatarStore::fallback();
+        store.disk = Some(AvatarCache::open(&dir).unwrap());
+        assert!(!store.request(url));
+        assert!(matches!(
+            store.cache.get(url),
+            Some(AvatarStatus::Ready { .. })
+        ));
+        assert!(store.request("https://cdn.discordapp.com/avatars/123/newhash.png?size=64"));
+        drop(store);
+        drop(cleanup);
+    }
+
+    #[test]
+    fn failed_download_releases_a_slot_to_the_next_unique_avatar() {
+        let mut store = AvatarStore::fallback();
+        let url = |id| format!("https://cdn.discordapp.com/avatars/{id}/abcd.png?size=64");
+        for id in 0..MAX_AVATAR_DOWNLOADS {
+            assert!(store.request(&url(id)));
+        }
+        let queued = url(MAX_AVATAR_DOWNLOADS);
+        assert!(!store.request(&queued));
+        assert!(!store.request(&queued));
+        assert_eq!(store.finish_request(url(0), None), Some(queued.clone()));
+        assert!(store.finish_request(queued, None).is_none());
+        assert!(store.request(&url(MAX_AVATAR_DOWNLOADS + 1)));
     }
 }

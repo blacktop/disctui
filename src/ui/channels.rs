@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 use unicode_width::UnicodeWidthStr;
 
+use crate::action::PaneRow;
 use crate::model::{ChannelKind, ChannelSummary};
 use crate::ui::theme;
 use crate::ui::truncate_name;
@@ -21,7 +22,11 @@ pub fn render(
     channels: &[ChannelSummary],
     state: &mut ListState,
     chrome: &PaneChrome,
-) {
+    hits: &mut Vec<(Rect, PaneRow)>,
+) -> (u16, usize) {
+    if area.is_empty() {
+        return (0, 0);
+    }
     // The right-hand hairline takes one column.
     let row_width = usize::from(area.width.saturating_sub(1));
     let cursor = state.selected();
@@ -38,16 +43,72 @@ pub fn render(
         })
         .collect();
 
+    let block = Block::new()
+        .borders(Borders::RIGHT)
+        .border_style(theme::divider())
+        .title(title_line(chrome, row_width));
+    let inner = block.inner(area);
+    let mut remaining = usize::from(inner.height);
+    let last_page_len = items
+        .iter()
+        .rev()
+        .take_while(|item| {
+            let Some(next) = remaining.checked_sub(item.height()) else {
+                return false;
+            };
+            remaining = next;
+            true
+        })
+        .count();
+    let max_offset = items.len().saturating_sub(last_page_len.max(1));
     let list = List::new(items)
-        .block(
-            Block::new()
-                .borders(Borders::RIGHT)
-                .border_style(theme::divider())
-                .title(title_line(chrome, row_width)),
-        )
+        .block(block)
         .highlight_style(theme::selected_row(chrome.focused));
 
     frame.render_stateful_widget(list, area, state);
+
+    let mut y = inner.y;
+    for (index, channel, height) in visible_rows(channels, state.offset(), inner.height) {
+        if channel.kind.is_selectable() {
+            hits.push((
+                Rect::new(inner.x, y, inner.width, height),
+                PaneRow::Channel(index),
+            ));
+        }
+        y = y.saturating_add(height);
+    }
+    (inner.height, max_offset)
+}
+
+pub(super) fn wheel_selection(
+    channels: &[ChannelSummary],
+    offset: usize,
+    height: u16,
+    selected: Option<usize>,
+) -> Option<usize> {
+    // Ratatui moves the viewport to reveal its selection. Keep the cursor in the
+    // requested window so the wheel offset is honored even with taller category rows.
+    let anchor = selected.unwrap_or(offset);
+    visible_rows(channels, offset, height)
+        .filter(|(_, channel, _)| channel.kind.is_selectable())
+        .map(|(index, _, _)| index)
+        .min_by_key(|index| index.abs_diff(anchor))
+}
+
+fn visible_rows(
+    channels: &[ChannelSummary],
+    offset: usize,
+    height: u16,
+) -> impl Iterator<Item = (usize, &ChannelSummary, u16)> {
+    channels
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .scan(height, |remaining, (index, channel)| {
+            let height = 1 + u16::from(category_has_gap(channel, index));
+            *remaining = remaining.checked_sub(height)?;
+            Some((index, channel, height))
+        })
 }
 
 fn title_line(chrome: &PaneChrome, row_width: usize) -> Line<'static> {
@@ -70,11 +131,15 @@ fn title_line(chrome: &PaneChrome, row_width: usize) -> Line<'static> {
 fn category_item(channel: &ChannelSummary, index: usize, row_width: usize) -> ListItem<'static> {
     let name = truncate_name(&channel.name, row_width.saturating_sub(2));
     let label = Line::from(Span::styled(format!(" {name}"), theme::dim()));
-    if index == 0 {
-        ListItem::new(label)
-    } else {
+    if category_has_gap(channel, index) {
         ListItem::new(vec![Line::raw(""), label])
+    } else {
+        ListItem::new(label)
     }
+}
+
+fn category_has_gap(channel: &ChannelSummary, index: usize) -> bool {
+    channel.kind == ChannelKind::Category && index != 0
 }
 
 /// One channel row: unread marker, name, then the mention count flush right.

@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use ratatui::widgets::ListState;
 
-use crate::action::{Action, Origin};
+use crate::action::{Action, Origin, PaneRow};
 use crate::digest::{DigestOptions, DigestReport, Include, PreparedDigest};
 use crate::effect::Effect;
 use crate::message_actions::{self, DesktopAction, LinkPicker, MessageCursor};
@@ -223,6 +223,7 @@ enum UnreadDividerAnchor {
 pub struct App {
     pub input_mode: InputMode,
     pub focus: FocusPane,
+    pub mouse_targets: crate::ui::MouseTargets,
     pub should_quit: bool,
     pub show_help: bool,
     sign_in: Option<SignInState>,
@@ -291,6 +292,7 @@ impl App {
         Self {
             input_mode: InputMode::Normal,
             focus: FocusPane::Guilds,
+            mouse_targets: crate::ui::MouseTargets::default(),
             should_quit: false,
             show_help: false,
             sign_in: None,
@@ -444,6 +446,21 @@ impl App {
             Action::SetFocus(pane) => self.focus = pane,
             Action::MoveUp => self.move_selection(-1),
             Action::MoveDown => self.move_selection(1),
+            Action::ScrollGuilds(offset) => {
+                let delta = if offset < self.guild_state.offset() {
+                    -1
+                } else {
+                    1
+                };
+                move_list_selection(&mut self.guild_state, self.guilds.len(), delta);
+                *self.guild_state.offset_mut() = offset;
+                self.digest.rail_selected = false;
+            }
+            Action::ScrollChannels { offset, selection } => {
+                self.channel_state.select(selection);
+                *self.channel_state.offset_mut() = offset;
+            }
+            Action::ClickRow(row) => return self.click_row(row),
             Action::ScrollUp(n) if self.digest.visible => {
                 self.digest
                     .move_selection(-isize::try_from(n).unwrap_or(isize::MAX));
@@ -595,8 +612,14 @@ impl App {
                 self.summary_state.in_flight = false;
                 self.set_error(err);
             }
-            Action::AvatarLoaded { url, bytes } => self.avatars.store_bytes(url, bytes),
-            Action::AvatarFailed(url) => self.avatars.mark_failed(url),
+            Action::AvatarFinished { url, bytes } => {
+                return self
+                    .avatars
+                    .finish_request(url, bytes.as_deref())
+                    .into_iter()
+                    .map(|url| Effect::FetchAvatar { url })
+                    .collect();
+            }
             Action::Error(msg) => self.set_error(msg),
         }
 
@@ -738,7 +761,7 @@ impl App {
         Some((account, error))
     }
 
-    fn move_account_selection(&mut self, delta: i32) {
+    fn move_account_selection(&mut self, delta: isize) {
         let Some((account, error)) = self.signed_in_account() else {
             return;
         };
@@ -1915,18 +1938,17 @@ impl App {
                     "selected channel history loaded empty; read state will not advance"
                 );
             }
-            let effects = self.request_avatar_effects(
-                messages
-                    .iter()
-                    .filter_map(|msg| msg.author_avatar_url.as_deref()),
-            );
-            let mut attachment_effects = self.request_avatar_effects(
-                messages
-                    .iter()
-                    .flat_map(|msg| msg.attachments.iter())
-                    .filter(|attachment| attachment.is_image)
-                    .map(|attachment| attachment.url.as_str()),
-            );
+            let avatars = messages
+                .iter()
+                .rev()
+                .filter_map(|msg| msg.author_avatar_url.as_deref());
+            let attachments = messages
+                .iter()
+                .flat_map(|msg| msg.attachments.iter())
+                .filter(|attachment| attachment.is_image)
+                .map(|attachment| attachment.url.as_str());
+            let effects = self.request_avatar_effects(avatars.clone().chain(attachments));
+            self.avatars.prioritize_queued(avatars);
             let had_messages = !self.messages.is_empty();
             let preserved_divider = self
                 .unread_divider_message_id
@@ -1968,8 +1990,6 @@ impl App {
                 "history_loaded_after_apply",
                 Some(self.messages.len()),
             );
-            let mut effects = effects;
-            effects.append(&mut attachment_effects);
             return effects;
         }
         Vec::new()
@@ -2222,7 +2242,56 @@ impl App {
         vec![Effect::Desktop(action)]
     }
 
-    fn move_selection(&mut self, delta: i32) {
+    fn click_row(&mut self, row: PaneRow) -> Vec<Effect> {
+        match row {
+            PaneRow::Digest if !self.digest.visible => {
+                self.input_mode = InputMode::Normal;
+                self.focus = FocusPane::Guilds;
+                self.digest.rail_selected = true;
+                self.open_selected()
+            }
+            PaneRow::Guild(index) if let Some(guild) = self.guilds.get(index) => {
+                let already_open = self.selected_guild_id.as_ref() == Some(&guild.id);
+                self.input_mode = InputMode::Normal;
+                self.digest.visible = false;
+                self.digest.rail_selected = false;
+                self.guild_state.select(Some(index));
+                if already_open {
+                    self.focus = FocusPane::Channels;
+                    Vec::new()
+                } else {
+                    self.select_guild()
+                }
+            }
+            PaneRow::Channel(index)
+                if let Some(channel) = self.channels.get(index)
+                    && channel.kind.is_selectable() =>
+            {
+                let already_open = self.selected_channel_id.as_ref() == Some(&channel.id);
+                self.input_mode = InputMode::Normal;
+                self.channel_state.select(Some(index));
+                if already_open {
+                    self.focus = FocusPane::Messages;
+                    Vec::new()
+                } else {
+                    self.select_channel()
+                }
+            }
+            PaneRow::Message(index) if let Some(message) = self.messages.get(index) => {
+                // Focusing messages can change the column widths and rewrap the post.
+                self.message_cursor.reveal =
+                    matches!(self.focus, FocusPane::Guilds | FocusPane::Channels);
+                self.input_mode = InputMode::Normal;
+                self.focus = FocusPane::Messages;
+                self.message_cursor.selected = Some(message.id.clone());
+                self.at_bottom = false;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn move_selection(&mut self, delta: isize) {
         if self.digest.visible {
             self.digest.move_selection(if delta < 0 { -1 } else { 1 });
             return;
@@ -2763,7 +2832,7 @@ impl App {
             .position(|channel| channel.kind.is_selectable())
     }
 
-    fn move_channel_selection(&mut self, delta: i32) {
+    fn move_channel_selection(&mut self, delta: isize) {
         let selectable = self.selectable_channel_indices();
         if selectable.is_empty() {
             return;
@@ -2773,11 +2842,9 @@ impl App {
             .iter()
             .position(|idx| *idx == current_raw)
             .unwrap_or(0);
-        let next_pos = if delta > 0 {
-            current_pos.saturating_add(1).min(selectable.len() - 1)
-        } else {
-            current_pos.saturating_sub(1)
-        };
+        let next_pos = current_pos
+            .saturating_add_signed(delta)
+            .min(selectable.len() - 1);
         self.channel_state.select(Some(selectable[next_pos]));
     }
 
@@ -2790,16 +2857,12 @@ impl App {
     }
 }
 
-fn move_list_selection(state: &mut ListState, len: usize, delta: i32) {
+fn move_list_selection(state: &mut ListState, len: usize, delta: isize) {
     if len == 0 {
         return;
     }
     let current = state.selected().unwrap_or(0);
-    let new = if delta > 0 {
-        current.saturating_add(1).min(len - 1)
-    } else {
-        current.saturating_sub(1)
-    };
+    let new = current.saturating_add_signed(delta).min(len - 1);
     state.select(Some(new));
 }
 
@@ -3933,6 +3996,37 @@ mod tests {
         assert_eq!(
             app.message_scroll_offset, 5,
             "scroll unchanged for wrong channel"
+        );
+    }
+
+    #[test]
+    fn channel_switch_prioritizes_its_queued_avatars() {
+        let mut app = app_in_channel();
+        let previous_avatars: Vec<_> = (1..=16)
+            .map(|id| format!("https://cdn.discordapp.com/avatars/{id}/old.png?size=64"))
+            .collect();
+        let effects = app.request_avatar_effects(previous_avatars.iter().map(String::as_str));
+        let Some(Effect::FetchAvatar { url: active }) = effects.into_iter().next() else {
+            unreachable!("previous channel should have downloads in flight");
+        };
+
+        app.update(Action::OpenChannel("c3".into()));
+        let mut messages = mock::messages("c3");
+        let current_avatar = "https://cdn.discordapp.com/avatars/17/current.png?size=64";
+        messages.first_mut().unwrap().author_avatar_url = Some(current_avatar.into());
+        app.update(Action::HistoryLoaded {
+            channel_id: "c3".into(),
+            messages,
+            has_more: false,
+        });
+
+        let next = app.update(Action::AvatarFinished {
+            url: active,
+            bytes: None,
+        });
+        assert!(
+            matches!(next.as_slice(), [Effect::FetchAvatar { url }] if url == current_avatar),
+            "{next:?}"
         );
     }
 

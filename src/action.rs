@@ -30,6 +30,12 @@ pub enum Action {
     JumpBottom,
     ScrollUp(u16),
     ScrollDown(u16),
+    ScrollGuilds(usize),
+    ScrollChannels {
+        offset: usize,
+        selection: Option<usize>,
+    },
+    ClickRow(PaneRow),
     OpenSelected,
     /// Open a channel by id, from `--open` or the control socket.
     OpenChannel(String),
@@ -144,13 +150,20 @@ pub enum Action {
         job: Instant,
         report: DigestReport,
     },
-    AvatarLoaded {
+    AvatarFinished {
         url: String,
-        bytes: Vec<u8>,
+        bytes: Option<Vec<u8>>,
     },
-    AvatarFailed(String),
 
     Error(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneRow {
+    Digest,
+    Guild(usize),
+    Channel(usize),
+    Message(usize),
 }
 
 /// Where an action comes from. A modal popup drops what the person typed and
@@ -179,6 +192,9 @@ impl Action {
             | Self::JumpBottom
             | Self::ScrollUp(_)
             | Self::ScrollDown(_)
+            | Self::ScrollGuilds(_)
+            | Self::ScrollChannels { .. }
+            | Self::ClickRow(_)
             | Self::OpenSelected
             | Self::CloseSelectedDirectMessage
             | Self::RefreshNow
@@ -226,8 +242,7 @@ impl Action {
             | Self::SummaryReady(_)
             | Self::SummaryFailed(_)
             | Self::DigestReady { .. }
-            | Self::AvatarLoaded { .. }
-            | Self::AvatarFailed(_)
+            | Self::AvatarFinished { .. }
             | Self::DesktopFinished(_)
             | Self::Error(_) => Origin::Delivered,
             #[cfg(feature = "experimental-discord")]

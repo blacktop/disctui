@@ -6,6 +6,7 @@ use ratatui::widgets::Paragraph;
 use textwrap::wrap;
 use unicode_width::UnicodeWidthStr;
 
+use crate::action::PaneRow;
 use crate::message_actions::MessageCursor;
 use crate::model::MessageRow;
 use crate::ui::media::{AvatarStore, AvatarTone, badge_from_name};
@@ -40,6 +41,10 @@ struct ImageMarker {
 /// Columns left empty between the pane edge and the avatar gutter.
 const LEFT_PADDING: u16 = 1;
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "uses the rendered message ranges for click targets"
+)]
 pub fn render(
     frame: &mut Frame,
     area: Rect,
@@ -48,6 +53,7 @@ pub fn render(
     scroll_offset: u16,
     avatars: &mut AvatarStore,
     cursor: &mut MessageCursor,
+    hits: &mut Vec<(Rect, PaneRow)>,
 ) -> (u16, u16) {
     let inner = Rect {
         x: area.x + LEFT_PADDING.min(area.width),
@@ -111,16 +117,25 @@ pub fn render(
     frame.render_widget(paragraph, text_area);
     render_avatars(frame, avatar_area, offset, avatars, &plan.avatars);
     render_images(frame, text_area, offset, avatars, &plan.images);
-    if area.width > 0
-        && let Some(range) = target.and_then(|index| plan.message_lines.get(index))
+    for (index, range) in plan
+        .message_lines
+        .iter()
+        .enumerate()
+        .filter(|(_, range)| touches_viewport(range))
     {
-        for line in range.start.max(viewport.start)..range.end.min(viewport.end) {
-            let row = u16::try_from(line - viewport.start).unwrap_or_default();
-            if let Some(cell) = frame
-                .buffer_mut()
-                .cell_mut((area.x, area.y.saturating_add(row)))
-            {
-                cell.set_symbol("▌").set_style(theme::selected_item());
+        let start = range.start.max(viewport.start) - viewport.start;
+        let end = range.end.min(viewport.end) - viewport.start;
+        let top = area
+            .y
+            .saturating_add(u16::try_from(start).unwrap_or(u16::MAX));
+        let height = u16::try_from(end - start).unwrap_or(u16::MAX);
+        let rows = Rect::new(area.x, top, area.width, height);
+        hits.push((rows, PaneRow::Message(index)));
+        if target == Some(index) {
+            for y in rows.y..rows.bottom() {
+                if let Some(cell) = frame.buffer_mut().cell_mut((rows.x, y)) {
+                    cell.set_symbol("▌").set_style(theme::selected_item());
+                }
             }
         }
     }

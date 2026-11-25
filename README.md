@@ -76,7 +76,7 @@ just release v0.2.0   # release the version already in Cargo.toml
 
 Pushing a signed `vX.Y.Z` tag runs the release workflow, which builds both macOS architectures with GoReleaser and updates the Homebrew cask.
 
-To act on a message, focus the message pane with `3` and select it with `Shift+J` or `Shift+K`. On macOS, press `c` to copy the full text or `o` to open a web link. If there are several links, use `j` or `k` and Enter to choose one. Use `Shift+C` to connect or reconnect.
+Click a server or channel to open it, and scroll with the wheel over the pane you want to move. Click a message to select it, or focus the message pane with `3` and use `Shift+J` or `Shift+K`. On macOS, press `c` to copy the full text or `o` to open a web link. If there are several links, use `j` or `k` and Enter to choose one. Use `Shift+C` to connect or reconnect.
 
 ## Auth
 
@@ -242,7 +242,7 @@ Start from [`config.toml.example`](./config.toml.example).
 Config keys:
 
 - `tick_rate_ms`
-- `mouse`
+- `mouse` (defaults to `true`, set to `false` for terminal-native mouse selection)
 - `ai_backend`
 - `ai_base_url`
 - `ai_model`
@@ -271,6 +271,8 @@ Headless commands (`digest`, `channels`, `open`) print warnings to stderr and le
 State is stored in:
 
 - macOS cache DB: `~/Library/Caches/disctui/disctui.db`
+
+User avatars and server icons are cached as PNG thumbnails up to 64 × 64 pixels in `~/Library/Caches/io.blacktop.disctui/avatars.sqlite3` on macOS. The database is capped at 16 MiB and is safe to remove when disctui is closed.
 
 ## Limitations
 

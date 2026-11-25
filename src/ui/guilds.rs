@@ -1,3 +1,4 @@
+use crate::action::PaneRow;
 use crate::app::DigestPaneState;
 use crate::model::GuildSummary;
 use crate::ui::media::{AvatarStore, AvatarTone, badge_from_name};
@@ -30,9 +31,10 @@ pub fn render(
     selected_guild_id: Option<&str>,
     avatars: &mut AvatarStore,
     digest: Option<&DigestPaneState>,
-) {
+    mut hits: Option<&mut Vec<(Rect, PaneRow)>>,
+) -> usize {
     if area.is_empty() {
-        return;
+        return 0;
     }
     let block = Block::new()
         .borders(Borders::RIGHT)
@@ -54,6 +56,9 @@ pub fn render(
             row = row.style(theme::selected_row(true));
         }
         frame.render_widget(row, digest_area);
+        if let Some(hits) = hits.as_mut() {
+            hits.push((digest_area, PaneRow::Digest));
+        }
         rest
     } else {
         inner
@@ -64,7 +69,7 @@ pub fn render(
             Paragraph::new("No servers loaded").style(theme::dim()),
             inner,
         );
-        return;
+        return 0;
     }
 
     let collapsed = !focused;
@@ -100,7 +105,10 @@ pub fn render(
         selected_guild_id,
         avatars,
         collapsed,
+        hits,
     );
+    let rows_per_page = usize::from(list_area.height / row_height(collapsed));
+    guilds.len().saturating_sub(rows_per_page.max(1))
 }
 
 fn list_item(guild: &GuildSummary, width: u16, collapsed: bool) -> ListItem<'static> {
@@ -139,6 +147,10 @@ fn list_item(guild: &GuildSummary, width: u16, collapsed: bool) -> ListItem<'sta
     ListItem::new(vec![Line::from(""), Line::from(primary), Line::from("")])
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "shares the list's visible avatar and click rows"
+)]
 fn render_guild_avatars(
     frame: &mut Frame,
     area: Rect,
@@ -147,8 +159,17 @@ fn render_guild_avatars(
     selected_guild_id: Option<&str>,
     avatars: &mut AvatarStore,
     collapsed: bool,
+    mut hits: Option<&mut Vec<(Rect, PaneRow)>>,
 ) {
-    for (row_y, guild) in visible_guild_rows(guilds, state, area, collapsed) {
+    let height = row_height(collapsed);
+    let rows = (area.y..area.bottom()).step_by(usize::from(height));
+    for (row_y, (index, guild)) in rows.zip(guilds.iter().enumerate().skip(state.offset())) {
+        if let Some(hits) = hits.as_mut() {
+            hits.push((
+                Rect::new(area.x, row_y, area.width, height.min(area.bottom() - row_y)),
+                PaneRow::Guild(index),
+            ));
+        }
         let is_selected = selected_guild_id == Some(guild.id.as_str());
         if collapsed && is_selected {
             frame.render_widget(
@@ -217,31 +238,6 @@ fn row_height(collapsed: bool) -> u16 {
     } else {
         EXPANDED_ROW_HEIGHT
     }
-}
-
-fn visible_guild_rows<'a>(
-    guilds: &'a [GuildSummary],
-    state: &ListState,
-    area: Rect,
-    collapsed: bool,
-) -> impl Iterator<Item = (u16, &'a GuildSummary)> {
-    let row_height = row_height(collapsed);
-    let offset = state.offset();
-    let visible_rows = usize::from(area.height / row_height.max(1));
-    let row_count = visible_rows
-        .saturating_add(1)
-        .min(guilds.len().saturating_sub(offset));
-
-    guilds
-        .iter()
-        .skip(offset)
-        .take(row_count)
-        .enumerate()
-        .filter_map(move |(row_idx, guild)| {
-            let row_idx = u16::try_from(row_idx).ok()?;
-            let row_y = area.y.saturating_add(row_idx.saturating_mul(row_height));
-            (row_y < area.y + area.height).then_some((row_y, guild))
-        })
 }
 
 fn blank_lines(count: u16) -> Vec<Line<'static>> {

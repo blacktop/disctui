@@ -11,19 +11,98 @@ mod summary;
 pub mod theme;
 mod top_bar;
 
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::widgets::{Paragraph, Wrap};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::action::{Action, PaneRow};
 use crate::app::{App, FocusPane, MessagePaneView};
 
 /// Divider row plus two lines of text.
 const COMPOSER_HEIGHT: u16 = 3;
 
+/// Hit areas from the last drawn frame, including widget scroll offsets.
+#[derive(Default)]
+pub struct MouseTargets {
+    guilds: Rect,
+    max_guild_offset: usize,
+    channels: Rect,
+    channel_viewport: (u16, usize),
+    main: Rect,
+    rows: Vec<(Rect, PaneRow)>,
+}
+
+pub fn mouse_action(app: &App, event: MouseEvent) -> Option<Action> {
+    let point = Position::new(event.column, event.row);
+    let targets = &app.mouse_targets;
+    let up = match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            return targets
+                .rows
+                .iter()
+                .find(|(area, _)| area.contains(point))
+                .map(|(_, row)| Action::ClickRow(*row));
+        }
+        MouseEventKind::ScrollUp => true,
+        MouseEventKind::ScrollDown => false,
+        _ => return None,
+    };
+
+    if targets.guilds.contains(point) {
+        wheel_offset(
+            app.guild_state.offset(),
+            if up { -1 } else { 1 },
+            targets.max_guild_offset,
+        )
+        .map(Action::ScrollGuilds)
+    } else if targets.channels.contains(point) {
+        let (height, max_offset) = targets.channel_viewport;
+        if height == 0 {
+            return None;
+        }
+        let offset = wheel_offset(
+            app.channel_state.offset(),
+            if up { -3 } else { 3 },
+            max_offset,
+        )?;
+        Some(Action::ScrollChannels {
+            offset,
+            selection: channels::wheel_selection(
+                &app.channels,
+                offset,
+                height,
+                app.channel_state.selected(),
+            ),
+        })
+    } else if targets.main.contains(point) {
+        Some(match (app.digest.visible, app.message_pane_view, up) {
+            (false, MessagePaneView::Summary, true) => Action::SummarySelectPrevTodo,
+            (false, MessagePaneView::Summary, false) => Action::SummarySelectNextTodo,
+            (_, _, true) => Action::ScrollUp(3),
+            (_, _, false) => Action::ScrollDown(3),
+        })
+    } else {
+        None
+    }
+}
+
+fn wheel_offset(offset: usize, delta: isize, max_offset: usize) -> Option<usize> {
+    let next = offset
+        .saturating_add_signed(delta)
+        .min(max_offset.max(offset));
+    (next != offset).then_some(next)
+}
+
 /// Top-level render dispatch. Composes all widgets into the final frame.
 pub fn render(frame: &mut Frame, app: &mut App) {
     let [top_area, body, footer_area] = layout::root(frame.area());
+    app.mouse_targets.rows.clear();
+    app.mouse_targets = MouseTargets {
+        rows: std::mem::take(&mut app.mouse_targets.rows),
+        ..MouseTargets::default()
+    };
 
     top_bar::render(frame, top_area, &top_bar::TopBar::from_app(app));
     let popup_area = if let Some((account, avatars)) = app.account_rail() {
@@ -40,6 +119,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             None,
             None,
             avatars,
+            None,
             None,
         );
         account_area
@@ -75,7 +155,8 @@ fn render_panes(frame: &mut Frame, body: Rect, app: &mut App) {
     };
 
     let guild_pane_loading_bar = app.guild_pane_loading_bar();
-    guilds::render(
+    app.mouse_targets.guilds = guild_area;
+    app.mouse_targets.max_guild_offset = guilds::render(
         frame,
         guild_area,
         &app.guilds,
@@ -87,9 +168,11 @@ fn render_panes(frame: &mut Frame, body: Rect, app: &mut App) {
             .filter(|_| !app.digest.visible),
         &mut app.avatars,
         Some(&app.digest),
+        Some(&mut app.mouse_targets.rows),
     );
 
     if app.digest.visible {
+        app.mouse_targets.main = main_area;
         digest::render(frame, main_area, &mut app.digest);
         return;
     }
@@ -99,7 +182,8 @@ fn render_panes(frame: &mut Frame, body: Rect, app: &mut App) {
     let unread_divider_message_id = app.unread_divider_message_id().map(str::to_string);
     let channels_title = app.selected_guild_name().unwrap_or("Channels").to_string();
 
-    channels::render(
+    app.mouse_targets.channels = channel_area;
+    app.mouse_targets.channel_viewport = channels::render(
         frame,
         channel_area,
         &app.channels,
@@ -109,12 +193,14 @@ fn render_panes(frame: &mut Frame, body: Rect, app: &mut App) {
             focused: app.focus == FocusPane::Channels,
             loading_bar: channels_pane_loading_bar.as_deref(),
         },
+        &mut app.mouse_targets.rows,
     );
 
     if main_area.is_empty() {
         return;
     }
 
+    app.mouse_targets.main = content_area;
     match app.message_pane_view {
         MessagePaneView::Messages
             if app.messages.is_empty() && app.selected_history_status().is_some() =>
@@ -139,6 +225,7 @@ fn render_panes(frame: &mut Frame, body: Rect, app: &mut App) {
                 },
                 &mut app.avatars,
                 &mut app.message_cursor,
+                &mut app.mouse_targets.rows,
             );
             app.max_scroll = max_scroll;
             app.message_scroll_offset = actual_offset;
@@ -237,6 +324,128 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    fn send_mouse(app: &mut App, kind: MouseEventKind, column: u16, row: u16) -> Vec<Effect> {
+        let event = crossterm::event::Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        });
+        crate::map_runtime_event(&event, app).map_or_else(Vec::new, |action| app.update(action))
+    }
+
+    fn row_containing(rows: &[String], text: &str) -> u16 {
+        u16::try_from(rows.iter().position(|row| row.contains(text)).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn mouse_opens_servers_and_channels_and_ignores_category_rows() {
+        let mut app = app_reading_general();
+        let click = MouseEventKind::Down(MouseButton::Left);
+        render_rows(&mut app, 112, 24);
+        // Third server in the collapsed rail, below the title and Digest.
+        send_mouse(&mut app, click, 2, 14);
+        assert_eq!(app.selected_guild_id.as_deref(), Some("g3"));
+        assert_eq!(app.focus, FocusPane::Channels);
+        render_rows(&mut app, 112, 24);
+        send_mouse(&mut app, click, 2, 14);
+        assert_eq!(app.selected_guild_id.as_deref(), Some("g3"));
+
+        let rows = render_rows(&mut app, 96, 24);
+        let category = row_containing(&rows, "Async");
+        assert!(send_mouse(&mut app, click, 12, category).is_empty());
+        assert!(app.selected_channel_id.is_none());
+        let help = row_containing(&rows, "# help");
+
+        app.update(Action::ToggleHelp);
+        render_rows(&mut app, 96, 24);
+        assert!(send_mouse(&mut app, click, 12, help).is_empty());
+        assert!(app.selected_channel_id.is_none());
+        app.update(Action::ToggleHelp);
+        render_rows(&mut app, 96, 24);
+        assert!(matches!(
+            send_mouse(&mut app, click, 12, help).as_slice(),
+            [Effect::LoadHistory { channel_id }] if channel_id == "c21"
+        ));
+        assert_eq!(app.focus, FocusPane::Messages);
+    }
+
+    #[test]
+    fn mouse_wheel_does_not_skip_channel_categories_to_follow_the_cursor() {
+        let mut app = app_reading_general();
+        let fixture = mock::channels("g1");
+        let category = fixture
+            .iter()
+            .find(|row| !row.kind.is_selectable())
+            .unwrap();
+        let channel = fixture.iter().find(|row| row.kind.is_selectable()).unwrap();
+        app.channels = (0..8)
+            .flat_map(|index| {
+                let mut category = category.clone();
+                category.id = format!("section{index}");
+                let mut channel = channel.clone();
+                channel.id = format!("channel{index}");
+                channel.parent_id = Some(category.id.clone());
+                [category, channel]
+            })
+            .collect();
+        app.channel_state.select(Some(3));
+        render_rows(&mut app, 110, 9);
+        assert_eq!(app.channel_state.offset(), 0);
+
+        send_mouse(&mut app, MouseEventKind::ScrollDown, 10, 4);
+        render_rows(&mut app, 110, 9);
+        assert_eq!(app.channel_state.offset(), 3);
+    }
+
+    #[test]
+    fn wheel_scrolls_the_hovered_pane_and_clicked_wrapped_text_copies_the_full_post() {
+        use crate::message_actions::DesktopAction;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = app_reading_general();
+        let mut messages = mock::messages("c1");
+        messages.truncate(2);
+        let post = format!("first line\n{}\nlast line", "words ".repeat(100));
+        messages.first_mut().unwrap().content.clone_from(&post);
+        app.update(Action::HistoryLoaded {
+            channel_id: "c1".into(),
+            messages,
+            has_more: false,
+        });
+        render_rows(&mut app, 110, 9);
+        let offset = app.message_scroll_offset;
+        let guild_offset = app.guild_state.offset();
+        let channel_offset = app.channel_state.offset();
+        send_mouse(&mut app, MouseEventKind::ScrollDown, 2, 4);
+        assert!(app.guild_state.offset() > guild_offset);
+        assert_eq!(app.selected_guild_id.as_deref(), Some("g1"));
+        send_mouse(&mut app, MouseEventKind::ScrollDown, 10, 4);
+        assert!(app.channel_state.offset() > channel_offset);
+        assert_eq!(app.message_scroll_offset, offset);
+        assert_eq!(app.selected_channel_id.as_deref(), Some("c1"));
+
+        render_rows(&mut app, 110, 9);
+        send_mouse(&mut app, MouseEventKind::ScrollUp, 46, 3);
+        assert!(app.message_scroll_offset < offset);
+        let rows = render_rows(&mut app, 110, 9);
+        let wrapped = row_containing(&rows, "words words");
+        let before_click = app.message_scroll_offset;
+        send_mouse(
+            &mut app,
+            MouseEventKind::Down(MouseButton::Left),
+            46,
+            wrapped,
+        );
+        render_rows(&mut app, 110, 9);
+        assert_eq!(app.message_scroll_offset, before_click);
+        let copy = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        let action = crate::map_runtime_event(&copy, &mut app).unwrap();
+        assert!(
+            matches!(app.update(action).as_slice(), [Effect::Desktop(DesktopAction::Copy(text))] if text == &post)
+        );
     }
 
     #[test]

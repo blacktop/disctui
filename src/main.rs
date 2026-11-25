@@ -3,6 +3,7 @@ mod ai;
 mod app;
 #[cfg(feature = "experimental-discord")]
 mod auth;
+mod avatar_cache;
 mod cli;
 mod config;
 mod control;
@@ -25,7 +26,7 @@ mod web_login;
 
 use clap::Parser;
 use color_eyre::eyre::Result;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio::time::interval;
@@ -214,12 +215,12 @@ async fn main() -> Result<()> {
     tracing::info!("image protocol: {}", avatars.protocol_label());
     let store = std::rc::Rc::new(store::Store::open()?);
 
-    let mut terminal = tui::init()?;
+    let mut terminal = tui::init(config.mouse)?;
     let result = run(&mut terminal, &config, avatars, store, cli).await;
     if let Err(err) = &result {
         tracing::error!("run loop exited with error: {err:?}");
     }
-    tui::restore()?;
+    tui::restore(config.mouse)?;
 
     tracing::info!("disctui shutdown");
     result
@@ -247,7 +248,7 @@ async fn run(
         let _ = action_tx.try_send(Action::OpenChannel(channel_id));
     }
     let mut program_status = status::Reporter::stdout();
-    let mut term_events = EventStream::new();
+    let mut term_events = event::stream(config.mouse);
     let mut tick = interval(config.tick_rate());
     let ai_backend = config.summarizer_backend();
     tick.tick().await;
@@ -363,6 +364,9 @@ fn start_mock_transport(tx: &mpsc::Sender<Action>, ai_backend: Option<&Summarize
 }
 
 fn map_runtime_event(evt: &Event, app: &mut App) -> Option<Action> {
+    if let Event::Mouse(mouse) = evt {
+        return ui::mouse_action(app, *mouse);
+    }
     #[cfg(feature = "experimental-discord")]
     if app.has_sign_in() {
         return map_sign_in_event(evt, app);
@@ -597,7 +601,7 @@ fn execute_effect_offline(
     ai_backend: Option<&SummarizerBackend>,
 ) {
     match effect {
-        Effect::FetchAvatar { url } => execute_fetch_avatar(tx, &url),
+        Effect::FetchAvatar { url } => execute_fetch_avatar(tx, url),
         Effect::SummarizeChannel {
             channel_name,
             messages,
@@ -674,7 +678,7 @@ fn execute_effect_mock(
         Effect::GenerateDigest { job, request } => {
             execute_digest(tx, job, request, HistorySource::Mock, ai_backend);
         }
-        Effect::FetchAvatar { url } => execute_fetch_avatar(tx, &url),
+        Effect::FetchAvatar { url } => execute_fetch_avatar(tx, url),
     }
 }
 
@@ -778,7 +782,7 @@ fn execute_effect_discord(
                 ai_backend,
             );
         }
-        Effect::FetchAvatar { url } => execute_fetch_avatar(tx, &url),
+        Effect::FetchAvatar { url } => execute_fetch_avatar(tx, url),
     }
 }
 
@@ -989,21 +993,20 @@ fn execute_digest(
     });
 }
 
-fn execute_fetch_avatar(tx: &mpsc::Sender<Action>, url: &str) {
+fn execute_fetch_avatar(tx: &mpsc::Sender<Action>, url: String) {
     let tx = tx.clone();
-    let url = url.to_string();
     tokio::spawn(async move {
-        let action = match reqwest::get(&url).await {
-            Ok(response) if response.status().is_success() => match response.bytes().await {
-                Ok(bytes) => Action::AvatarLoaded {
-                    url,
-                    bytes: bytes.to_vec(),
-                },
-                Err(_) => Action::AvatarFailed(url),
-            },
-            _ => Action::AvatarFailed(url),
+        let bytes = if avatar_cache::key(&url).is_some() {
+            avatar_cache::fetch_png(&url).await
+        } else {
+            match reqwest::get(&url).await {
+                Ok(response) if response.status().is_success() => {
+                    response.bytes().await.ok().map(|bytes| bytes.to_vec())
+                }
+                _ => None,
+            }
         };
-        let _ = tx.send(action).await;
+        let _ = tx.send(Action::AvatarFinished { url, bytes }).await;
     });
 }
 

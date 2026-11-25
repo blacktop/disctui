@@ -1,7 +1,29 @@
-use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
+use futures_util::{Stream, StreamExt};
 
 use crate::action::Action;
 use crate::app::{FocusPane, InputMode};
+
+/// Drop mouse motion events before they can wake the render loop.
+pub fn stream(mouse_enabled: bool) -> impl Stream<Item = std::io::Result<Event>> + Unpin {
+    EventStream::new().filter(move |event| {
+        std::future::ready(match event {
+            Ok(Event::Mouse(mouse)) => {
+                mouse_enabled
+                    && mouse.modifiers.is_empty()
+                    && matches!(
+                        mouse.kind,
+                        MouseEventKind::Down(MouseButton::Left)
+                            | MouseEventKind::ScrollUp
+                            | MouseEventKind::ScrollDown
+                    )
+            }
+            _ => true,
+        })
+    })
+}
 
 /// Map a terminal event to an `Action`, given the current app mode and focus.
 pub fn map_terminal_event(event: &Event, mode: InputMode, focus: FocusPane) -> Option<Action> {
