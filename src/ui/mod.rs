@@ -55,11 +55,14 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         popup::render_sign_in(frame, popup_area, sign_in);
     } else if app.show_help {
         popup::render_help(frame, frame.area());
+    } else if let Some(picker) = &mut app.link_picker {
+        popup::render_link_picker(frame, frame.area(), picker);
     }
 }
 
 /// Servers, channels, and the message pane with its composer.
 fn render_panes(frame: &mut Frame, body: Rect, app: &mut App) {
+    app.message_cursor.visible = None;
     let [guild_area, channel_area, main_area] = if app.digest.visible {
         Layout::horizontal([
             Constraint::Length(9),
@@ -124,8 +127,7 @@ fn render_panes(frame: &mut Frame, body: Rect, app: &mut App) {
             );
         }
         MessagePaneView::Messages => {
-            // Single render pass: render returns max_scroll, avoiding double layout build
-            let max_scroll = messages::render(
+            let (max_scroll, actual_offset) = messages::render(
                 frame,
                 content_area,
                 &app.messages,
@@ -136,12 +138,10 @@ fn render_panes(frame: &mut Frame, body: Rect, app: &mut App) {
                     app.message_scroll_offset
                 },
                 &mut app.avatars,
+                &mut app.message_cursor,
             );
             app.max_scroll = max_scroll;
-            if app.at_bottom {
-                app.message_scroll_offset = max_scroll;
-            }
-            app.message_scroll_offset = app.message_scroll_offset.min(max_scroll);
+            app.message_scroll_offset = actual_offset;
         }
         MessagePaneView::Summary => {
             summary::render(
@@ -237,6 +237,152 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    #[test]
+    fn message_actions_select_a_long_post_and_copy_its_entire_source() {
+        use crate::app::InputMode;
+        use crate::message_actions::DesktopAction;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+
+        let mut app = app_reading_general();
+        let mut messages = mock::messages("c1");
+        messages.truncate(2);
+        let post = format!(
+            "Start of the long post\n{}\nhttps://example.com/one [second](https://example.com/two)",
+            "additional detail ".repeat(600)
+        );
+        let first = messages.first_mut().unwrap();
+        first.content.clone_from(&post);
+        let id = first.id.clone();
+        app.update(Action::HistoryLoaded {
+            channel_id: "c1".into(),
+            messages,
+            has_more: false,
+        });
+        let _ = render_rows(&mut app, 100, 24);
+        let action = |ch| {
+            crate::event::map_terminal_event(
+                &Event::Key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)),
+                InputMode::Normal,
+                FocusPane::Messages,
+            )
+            .unwrap()
+        };
+
+        assert!(app.update(action('K')).is_empty());
+        let rows = render_rows(&mut app, 100, 24);
+        assert_eq!(app.message_cursor.selected.as_deref(), Some(id.as_str()));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Start of the long post") && row.contains('▌'))
+        );
+
+        let effects = app.update(action('c'));
+        assert!(
+            matches!(effects.as_slice(), [Effect::Desktop(DesktopAction::Copy(text))] if text == &post)
+        );
+        app.update(Action::DesktopFinished(Ok("Copied message")));
+        assert!(
+            render_rows(&mut app, 100, 24)
+                .last()
+                .unwrap()
+                .contains("Copied message")
+        );
+
+        assert!(app.update(action('o')).is_empty());
+        assert!(
+            render_rows(&mut app, 100, 24)
+                .iter()
+                .any(|row| row.contains("Open link"))
+        );
+        app.update(Action::ShowMessages);
+        assert!(app.link_picker.is_none());
+        app.update(action('o'));
+        let _ = render_rows(&mut app, 100, 3);
+        assert!(app.update(Action::OpenSelected).is_empty());
+        assert!(app.link_picker.is_some());
+        app.update(Action::MoveDown);
+        let _ = render_rows(&mut app, 100, 24);
+        assert!(matches!(app.update(Action::OpenSelected).as_slice(),
+            [Effect::Desktop(DesktopAction::Open(url))] if url.as_str() == "https://example.com/two"));
+    }
+
+    #[test]
+    fn scrolling_keeps_the_highlighted_post_until_it_leaves_the_viewport() {
+        let mut app = app_reading_general();
+        let mut messages = mock::messages("c1");
+        messages.truncate(2);
+        let first = messages.first_mut().unwrap();
+        first.content = "Long post\n".repeat(90);
+        let id = first.id.clone();
+        app.update(Action::HistoryLoaded {
+            channel_id: "c1".into(),
+            messages,
+            has_more: false,
+        });
+        let _ = render_rows(&mut app, 100, 24);
+        app.update(Action::SelectMessage { older: true });
+        let _ = render_rows(&mut app, 100, 24);
+
+        app.update(Action::ScrollDown(1));
+        let _ = render_rows(&mut app, 100, 24);
+        assert_eq!(app.message_cursor.selected.as_deref(), Some(id.as_str()));
+
+        app.update(Action::ScrollDown(u16::MAX));
+        // A short viewport can put the selected post entirely above the screen.
+        let _ = render_rows(&mut app, 100, 8);
+        app.update(Action::ScrollDown(u16::MAX));
+        let _ = render_rows(&mut app, 100, 8);
+        assert!(app.message_cursor.selected.is_none());
+        assert_ne!(app.message_cursor.visible.as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn clipboard_success_preserves_a_connection_error() {
+        let mut app = App::new();
+        app.update(Action::TransportDisconnected("Network unavailable".into()));
+        app.update(Action::DesktopFinished(Ok("Copied message")));
+        assert_eq!(
+            app.status_error(),
+            Some("Network unavailable. Press Shift+C to reconnect.")
+        );
+    }
+
+    #[cfg(feature = "experimental-discord")]
+    #[test]
+    fn rich_bot_posts_have_a_body_in_channel_history() {
+        let author = serde_json::json!({"id": "20", "username": "release-bot", "bot": true});
+        let history = serde_json::json!([
+            {"id": "3", "author": author, "content": "", "timestamp": "2026-11-25T07:58:00Z",
+                "embeds": [{"type": "image", "image": {"url": "https://example.com/preview.png"}}]},
+            {"id": "2", "author": author, "content": "", "timestamp": "2026-11-25T07:57:00Z",
+                "components": [{"type": 17, "components": [{"type": 9, "components": [
+                    {"type": 10, "content": "Download the new build"}
+                ]}]}]},
+            {"id": "1", "author": author, "content": "", "timestamp": "2026-11-25T03:47:00Z",
+                "embeds": [{"type": "rich", "title": "Rex Preview", "description": "A new build is ready",
+                    "fields": [{"name": "Version", "value": "0.1.0-preview"}]}]}
+        ]);
+        let messages = crate::transport::discord::history_rows_from_value("c1", history).unwrap();
+        let mut app = app_reading_general();
+        app.update(Action::HistoryLoaded {
+            channel_id: "c1".into(),
+            messages,
+            has_more: false,
+        });
+        let screen = render_rows(&mut app, 120, 30).join("\n");
+        for text in [
+            "release-bot",
+            "Rex Preview",
+            "A new build is ready",
+            "Version",
+            "0.1.0-preview",
+            "Download the new build",
+            "[Rich content]",
+        ] {
+            assert!(screen.contains(text), "missing {text} in frame:\n{screen}");
+        }
     }
 
     #[test]

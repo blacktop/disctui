@@ -86,7 +86,6 @@ mod live {
 
     use color_eyre::eyre::{Result, eyre};
     use tokio::sync::mpsc;
-    use zeroize::Zeroize;
 
     use crate::action::Action;
     use crate::app::App;
@@ -104,13 +103,11 @@ mod live {
     }
 
     pub async fn connect() -> Result<(Session, App)> {
-        let mut token = auth::get_token().map_err(|err| {
+        let saved = auth::get_session().map_err(|err| {
             eyre!("no Discord token ({err}). Run `disctui` once to sign in, or set DISCTUI_TOKEN")
         })?;
         let (tx, mut rx) = mpsc::channel::<Action>(ACTION_CHANNEL_CAPACITY);
-        let connected = discord::connect(token.clone(), tx);
-        token.zeroize();
-        let (client, handle) = connected?;
+        let (client, handle) = discord::connect(saved, tx)?;
         let session = Session { client, handle };
 
         let mut app = App::new();

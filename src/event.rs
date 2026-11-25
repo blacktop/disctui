@@ -55,7 +55,15 @@ fn map_normal_mode(key: &KeyEvent, focus: FocusPane) -> Option<Action> {
         KeyCode::Enter => Some(Action::OpenSelected),
         KeyCode::Char('x') => Some(Action::CloseSelectedDirectMessage),
         KeyCode::Char('i') => Some(Action::EnterInsert),
-        KeyCode::Char('c') => Some(Action::ReconnectTransport),
+        KeyCode::Char('C') => Some(Action::ReconnectTransport),
+        KeyCode::Char('K') if focus == FocusPane::Messages => {
+            Some(Action::SelectMessage { older: true })
+        }
+        KeyCode::Char('J') if focus == FocusPane::Messages => {
+            Some(Action::SelectMessage { older: false })
+        }
+        KeyCode::Char('c') if focus == FocusPane::Messages => Some(Action::CopyMessage),
+        KeyCode::Char('o') if focus == FocusPane::Messages => Some(Action::OpenMessageLink),
         KeyCode::Char('r') => Some(Action::RefreshNow),
         KeyCode::Char('?') => Some(Action::ToggleHelp),
         KeyCode::Char('R') => Some(Action::MarkAllRead),
@@ -127,8 +135,8 @@ mod tests {
     }
 
     #[test]
-    fn c_key_triggers_reconnect() {
-        let event = Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    fn uppercase_c_key_triggers_reconnect() {
+        let event = Event::Key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::SHIFT));
         assert!(matches!(
             map_terminal_event(&event, InputMode::Normal, FocusPane::Messages),
             Some(Action::ReconnectTransport)

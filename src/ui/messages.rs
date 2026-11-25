@@ -6,6 +6,7 @@ use ratatui::widgets::Paragraph;
 use textwrap::wrap;
 use unicode_width::UnicodeWidthStr;
 
+use crate::message_actions::MessageCursor;
 use crate::model::MessageRow;
 use crate::ui::media::{AvatarStore, AvatarTone, badge_from_name};
 use crate::ui::theme;
@@ -19,6 +20,7 @@ struct MessageLayoutPlan {
     lines: Vec<Line<'static>>,
     avatars: Vec<AvatarMarker>,
     images: Vec<ImageMarker>,
+    message_lines: Vec<std::ops::Range<usize>>,
 }
 
 struct AvatarMarker {
@@ -45,7 +47,8 @@ pub fn render(
     unread_divider_message_id: Option<&str>,
     scroll_offset: u16,
     avatars: &mut AvatarStore,
-) -> u16 {
+    cursor: &mut MessageCursor,
+) -> (u16, u16) {
     let inner = Rect {
         x: area.x + LEFT_PADDING.min(area.width),
         y: area.y,
@@ -71,14 +74,57 @@ pub fn render(
     let viewport_height = text_area.height;
     let max_scroll = total_lines.saturating_sub(viewport_height);
     // Clamp scroll offset so caller can pass u16::MAX for "scroll to bottom"
-    let clamped_offset = scroll_offset.min(max_scroll);
+    let mut offset = scroll_offset.min(max_scroll);
+    let selected = cursor
+        .selected
+        .as_ref()
+        .and_then(|id| messages.iter().position(|msg| &msg.id == id));
+    if std::mem::take(&mut cursor.reveal)
+        && let Some(range) = selected.and_then(|index| plan.message_lines.get(index))
+    {
+        let height = usize::from(viewport_height);
+        let row = if range.start < usize::from(offset) || range.len() > height {
+            range.start
+        } else {
+            usize::from(offset).max(range.end.saturating_sub(height))
+        };
+        offset = u16::try_from(row).unwrap_or(u16::MAX).min(max_scroll);
+    }
+    let viewport = usize::from(offset)..usize::from(offset) + usize::from(viewport_height);
+    let touches_viewport = |range: &std::ops::Range<usize>| {
+        !text_area.is_empty()
+            && !range.is_empty()
+            && range.end > viewport.start
+            && range.start < viewport.end
+    };
+    let selected =
+        selected.filter(|&index| plan.message_lines.get(index).is_some_and(touches_viewport));
+    if selected.is_none() {
+        cursor.selected = None;
+    }
+    let target = selected.or_else(|| plan.message_lines.iter().rposition(touches_viewport));
+    cursor.visible = target
+        .and_then(|index| messages.get(index))
+        .map(|msg| msg.id.clone());
 
-    let paragraph = Paragraph::new(plan.lines).scroll((clamped_offset, 0));
-
+    let paragraph = Paragraph::new(plan.lines).scroll((offset, 0));
     frame.render_widget(paragraph, text_area);
-    render_avatars(frame, avatar_area, clamped_offset, avatars, &plan.avatars);
-    render_images(frame, text_area, clamped_offset, avatars, &plan.images);
-    max_scroll
+    render_avatars(frame, avatar_area, offset, avatars, &plan.avatars);
+    render_images(frame, text_area, offset, avatars, &plan.images);
+    if area.width > 0
+        && let Some(range) = target.and_then(|index| plan.message_lines.get(index))
+    {
+        for line in range.start.max(viewport.start)..range.end.min(viewport.end) {
+            let row = u16::try_from(line - viewport.start).unwrap_or_default();
+            if let Some(cell) = frame
+                .buffer_mut()
+                .cell_mut((area.x, area.y.saturating_add(row)))
+            {
+                cell.set_symbol("▌").set_style(theme::selected_item());
+            }
+        }
+    }
+    (max_scroll, offset)
 }
 
 fn build_message_layout(
@@ -91,12 +137,14 @@ fn build_message_layout(
             lines: vec![Line::from(Span::styled("No messages yet", theme::dim()))],
             avatars: Vec::new(),
             images: Vec::new(),
+            message_lines: Vec::new(),
         };
     }
 
     let mut lines = Vec::new();
     let mut avatars = Vec::new();
     let mut images = Vec::new();
+    let mut message_lines = Vec::with_capacity(messages.len());
 
     let wrap_width = usize::from(text_width.saturating_sub(2).max(8));
 
@@ -164,6 +212,7 @@ fn build_message_layout(
             }
         }
 
+        message_lines.push(group_start..lines.len());
         let next_starts_new_group = messages
             .get(idx + 1)
             .is_none_or(|next| !next.is_continuation);
@@ -178,6 +227,7 @@ fn build_message_layout(
         lines,
         avatars,
         images,
+        message_lines,
     }
 }
 

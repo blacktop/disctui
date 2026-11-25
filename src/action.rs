@@ -36,6 +36,12 @@ pub enum Action {
     CloseSelectedDirectMessage,
     RefreshNow,
     ReconnectTransport,
+    SelectMessage {
+        older: bool,
+    },
+    CopyMessage,
+    OpenMessageLink,
+    DesktopFinished(Result<&'static str, &'static str>),
     LoadStarted(LoadScope),
     LoadFailed {
         scope: LoadScope,
@@ -177,6 +183,9 @@ impl Action {
             | Self::CloseSelectedDirectMessage
             | Self::RefreshNow
             | Self::ReconnectTransport
+            | Self::SelectMessage { .. }
+            | Self::CopyMessage
+            | Self::OpenMessageLink
             | Self::EnterInsert
             | Self::ExitInsert
             | Self::ToggleHelp
@@ -219,6 +228,7 @@ impl Action {
             | Self::DigestReady { .. }
             | Self::AvatarLoaded { .. }
             | Self::AvatarFailed(_)
+            | Self::DesktopFinished(_)
             | Self::Error(_) => Origin::Delivered,
             #[cfg(feature = "experimental-discord")]
             Self::WebSignInProgress(_)

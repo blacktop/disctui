@@ -6,6 +6,7 @@ use crate::model::MessageRow;
 #[derive(Debug, Clone)]
 #[expect(dead_code, reason = "fields read by effect executor via pattern match")]
 pub enum Effect {
+    Desktop(crate::message_actions::DesktopAction),
     LoadGuilds,
     LoadChannels {
         guild_id: String,

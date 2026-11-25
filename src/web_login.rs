@@ -238,7 +238,7 @@ fn capture() -> Result<Captured> {
 pub async fn helper() -> Result<()> {
     let captured = capture()?;
     report_stage("verifying");
-    validate_and_save(&captured).await?;
+    validate_and_save(captured).await?;
     report_stage("saved");
     Ok(())
 }
@@ -356,7 +356,7 @@ fn report_stage(stage: &str) {
 }
 
 /// Confirm Discord accepts the captured session, then save it.
-async fn validate_and_save(captured: &Captured) -> Result<()> {
+async fn validate_and_save(mut captured: Captured) -> Result<()> {
     let client = crate::auth::http_client(Duration::from_secs(20))?;
     let response = crate::auth::get_with_retry(
         &client,
@@ -370,30 +370,17 @@ async fn validate_and_save(captured: &Captured) -> Result<()> {
             response.status()
         );
     }
-    save_session(captured)
-}
-
-/// Save the session with the client properties its Gateway connection must
-/// present. A session without them is not saved: Discord revokes a web
-/// session that identifies as a different client.
-fn save_session(captured: &Captured) -> Result<()> {
-    let Some(properties) = &captured.client_properties else {
+    // The saved session needs its client metadata to connect.
+    let Some(properties) = captured.client_properties else {
         bail!(
             "Discord's page did not report its client properties, so the session was not \
              saved. Its Gateway connection would identify as a different client and Discord \
              would revoke it. Sign in again."
         );
     };
-    crate::auth::store_token(&captured.token)?;
-    crate::auth::store_client_properties(properties)?;
-    let saved = Zeroizing::new(crate::auth::get_saved_token()?);
-    if saved.as_str() != captured.token.as_str() {
-        bail!("Keychain returned a different message session after saving");
-    }
-    if crate::auth::client_properties_for(&saved).as_ref() != Some(properties) {
-        bail!("Keychain returned different client properties after saving");
-    }
-    Ok(())
+    let token = std::mem::take(&mut *captured.token);
+    let session = crate::auth::MessageSession::new(token, Some(properties));
+    crate::auth::save_session(&session)
 }
 
 #[cfg(test)]

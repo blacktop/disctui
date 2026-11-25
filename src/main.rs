@@ -11,6 +11,7 @@ mod effect;
 mod event;
 mod headless;
 mod logging;
+mod message_actions;
 mod model;
 #[cfg(feature = "experimental-discord")]
 mod oauth;
@@ -334,8 +335,8 @@ async fn run(
 
 #[cfg(feature = "experimental-discord")]
 fn start_transport(app: &mut App, tx: &mpsc::Sender<Action>, discord: &mut DiscordRuntime) {
-    match auth::get_token() {
-        Ok(token) => match connect_discord_with_token(&token, tx) {
+    match auth::get_session() {
+        Ok(session) => match connect_discord_session(session, tx) {
             Ok(state) => {
                 app.start_load_scope(LoadScope::StartupConnect);
                 discord.state = Some(state);
@@ -472,6 +473,10 @@ fn handle_reconnect_action(
         return false;
     };
 
+    if app.link_picker.is_some() {
+        return true;
+    }
+
     match app.connection_state {
         ConnectionState::Disconnected
         | ConnectionState::SessionExpired
@@ -493,14 +498,14 @@ fn reconnect_discord(app: &mut App, tx: &mpsc::Sender<Action>, discord: &mut Dis
     let preserve_mock_transport = app.connection_state == ConnectionState::MockTransport;
     dispose_discord_state(&mut discord.state, true);
 
-    let Ok(mut token) = auth::get_token() else {
+    let Ok(session) = auth::get_session() else {
         // Nothing saved yet: connecting means signing in.
         show_sign_in_after_reconnect(app, discord, preserve_mock_transport, None);
         return;
     };
 
     app.start_load_scope(LoadScope::StartupConnect);
-    match connect_discord_with_token(&token, tx) {
+    match connect_discord_session(session, tx) {
         Ok(state) => {
             app.connection_state = ConnectionState::Reconnecting;
             discord.state = Some(state);
@@ -516,7 +521,6 @@ fn reconnect_discord(app: &mut App, tx: &mpsc::Sender<Action>, discord: &mut Dis
             );
         }
     }
-    token.zeroize();
 }
 
 #[cfg(feature = "experimental-discord")]
@@ -560,6 +564,17 @@ fn dispatch_effects(
     #[cfg(feature = "experimental-discord")] use_mock: bool,
 ) {
     for effect in effects {
+        let effect = match effect {
+            Effect::Desktop(action) => {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let result = action.run().await;
+                    let _ = tx.send(Action::DesktopFinished(result)).await;
+                });
+                continue;
+            }
+            effect => effect,
+        };
         #[cfg(feature = "experimental-discord")]
         if let Some(ds) = discord {
             execute_effect_discord(effect, tx, ds, ai_backend);
@@ -599,7 +614,8 @@ fn execute_effect_offline(
         Effect::LoadGuilds
         | Effect::LoadChannels { .. }
         | Effect::LoadHistory { .. }
-        | Effect::GenerateDigest { .. } => {}
+        | Effect::GenerateDigest { .. }
+        | Effect::Desktop(_) => {}
     }
 }
 
@@ -646,7 +662,7 @@ fn execute_effect_mock(
                     .await;
             });
         }
-        Effect::SendMessage { .. } => {} // already appended locally
+        Effect::Desktop(_) | Effect::SendMessage { .. } => {} // handled elsewhere
         Effect::SummarizeChannel {
             channel_name,
             messages,
@@ -670,7 +686,7 @@ fn execute_effect_discord(
     ai_backend: Option<&SummarizerBackend>,
 ) {
     match effect {
-        Effect::LoadGuilds => {
+        Effect::Desktop(_) | Effect::LoadGuilds => {
             // Guilds arrive via GUILD_CREATE events, not loaded explicitly
         }
         Effect::LoadChannels { guild_id } => {
@@ -767,9 +783,12 @@ fn execute_effect_discord(
 }
 
 #[cfg(feature = "experimental-discord")]
-fn connect_discord_with_token(token: &str, tx: &mpsc::Sender<Action>) -> Result<DiscordState> {
+fn connect_discord_session(
+    session: auth::MessageSession,
+    tx: &mpsc::Sender<Action>,
+) -> Result<DiscordState> {
     auth::log_tos_warning();
-    let (client, handle) = transport::discord::connect(token.to_string(), tx.clone())?;
+    let (client, handle) = transport::discord::connect(session, tx.clone())?;
     Ok(DiscordState {
         session: std::time::Instant::now(),
         client,
@@ -1168,21 +1187,16 @@ fn handle_sign_in_action(
     true
 }
 
-/// Connect with the session the sign-in window just saved.
-///
-/// The Keychain copy is used exactly as saved. Re-storing it would drop the
-/// client properties saved beside it, and Discord revokes a session whose
-/// Gateway connection identifies as a different client.
+/// Connect with the complete record the sign-in window just saved.
 #[cfg(all(target_os = "macos", feature = "experimental-discord"))]
 fn connect_with_saved_session(
     app: &mut App,
     tx: &mpsc::Sender<Action>,
     discord: &mut DiscordRuntime,
 ) -> Result<(), String> {
-    let mut token = auth::get_saved_token().map_err(|err| err.to_string())?;
+    let session = auth::get_saved_session().map_err(|err| err.to_string())?;
     app.start_load_scope(LoadScope::StartupConnect);
-    let connected = connect_discord_with_token(&token, tx);
-    token.zeroize();
+    let connected = connect_discord_session(session, tx);
     match connected {
         Ok(state) => {
             discord.stop_web_sign_in();
@@ -1208,10 +1222,11 @@ fn connect_with_new_token(
     tx: &mpsc::Sender<Action>,
     discord: &mut DiscordRuntime,
 ) -> Result<(), String> {
-    auth::store_token(token).map_err(|err| err.to_string())?;
+    let session = auth::MessageSession::new(token.to_owned(), None);
+    auth::save_session(&session).map_err(|err| err.to_string())?;
 
     app.start_load_scope(LoadScope::StartupConnect);
-    match connect_discord_with_token(token, tx) {
+    match connect_discord_session(session, tx) {
         Ok(state) => {
             app.dismiss_sign_in();
             let _ = app.update(Action::TransportConnecting);

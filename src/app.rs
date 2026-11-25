@@ -7,6 +7,7 @@ use ratatui::widgets::ListState;
 use crate::action::{Action, Origin};
 use crate::digest::{DigestOptions, DigestReport, Include, PreparedDigest};
 use crate::effect::Effect;
+use crate::message_actions::{self, DesktopAction, LinkPicker, MessageCursor};
 use crate::model::{
     ChannelDigest, ChannelKind, ChannelSummary, DIRECT_MESSAGES_GUILD_ID,
     DIRECT_MESSAGES_GUILD_NAME, GuildMuteSettings, GuildSummary, LoadScope, MessageRow,
@@ -234,6 +235,10 @@ pub struct App {
     pub selected_channel_id: Option<String>,
     pub messages: Vec<MessageRow>,
     pub message_scroll_offset: u16,
+    pub message_cursor: MessageCursor,
+    pub link_picker: Option<LinkPicker>,
+    desktop_pending: bool,
+    desktop_notice: Option<(&'static str, Instant)>,
     /// Maximum valid scroll offset, computed during render.
     pub max_scroll: u16,
     /// When true, the render loop auto-scrolls to show the newest messages.
@@ -298,6 +303,10 @@ impl App {
             selected_channel_id: None,
             messages: Vec::new(),
             message_scroll_offset: 0,
+            message_cursor: MessageCursor::default(),
+            link_picker: None,
+            desktop_pending: false,
+            desktop_notice: None,
             max_scroll: 0,
             at_bottom: true,
             message_pane_view: MessagePaneView::Messages,
@@ -370,6 +379,13 @@ impl App {
                 Origin::Input if !closes_help => return Vec::new(),
                 Origin::Input | Origin::Delivered => {}
             }
+        }
+
+        if self.link_picker.is_some()
+            && action.origin() == Origin::Input
+            && !matches!(action, Action::Quit)
+        {
+            return self.update_link_picker(&action);
         }
 
         match action {
@@ -455,6 +471,23 @@ impl App {
             Action::CloseSelectedDirectMessage => return self.close_selected_direct_message(),
             Action::RefreshNow => return self.refresh_now(),
             Action::OpenSelected => return self.open_selected(),
+            Action::SelectMessage { older } if self.can_act_on_messages() => {
+                self.select_message(older);
+            }
+            Action::CopyMessage if self.can_act_on_messages() => return self.copy_message(),
+            Action::OpenMessageLink if self.can_act_on_messages() => {
+                return self.open_message_link();
+            }
+            Action::SelectMessage { .. } | Action::CopyMessage | Action::OpenMessageLink => {}
+            Action::DesktopFinished(result) => {
+                self.desktop_pending = false;
+                match result {
+                    Ok(message) => {
+                        self.desktop_notice = Some((message, Instant::now()));
+                    }
+                    Err(message) => self.set_error(message.into()),
+                }
+            }
             Action::OpenChannel(channel_id) => return self.request_open_channel(channel_id),
             Action::EnterInsert | Action::StartQuickReplyFromSummary => {
                 self.input_mode = InputMode::Insert;
@@ -513,7 +546,7 @@ impl App {
                 self.finish_load_scope(&LoadScope::StartupConnect);
                 self.finish_load_scope(&LoadScope::GuildBootstrap);
                 self.connection_state = ConnectionState::Disconnected;
-                self.set_error(format!("{reason}. Press c to reconnect."));
+                self.set_error(format!("{reason}. Press Shift+C to reconnect."));
             }
             Action::GuildsLoaded(g) => {
                 self.finish_load_scope(&LoadScope::GuildBootstrap);
@@ -629,6 +662,10 @@ impl App {
         self.status_error.as_ref().map(|(msg, _)| msg.as_str())
     }
 
+    pub fn desktop_notice(&self) -> Option<&'static str> {
+        self.desktop_notice.map(|(message, _)| message)
+    }
+
     pub fn active_load_label(&self) -> Option<&'static str> {
         self.prioritized_load_scope().map(LoadScope::status_label)
     }
@@ -739,6 +776,7 @@ impl App {
         });
         self.input_mode = InputMode::Normal;
         self.show_help = false;
+        self.link_picker = None;
         if let Some(scope) = self.digest.waiting_for_channels.take() {
             self.finish_load_scope(&scope);
         }
@@ -1343,6 +1381,8 @@ impl App {
 
         self.channel_state.select(Some(ch_idx));
         self.selected_channel_id = Some(channel_id.clone());
+        self.message_cursor = MessageCursor::default();
+        self.link_picker = None;
         self.focus = FocusPane::Messages;
         tracing::info!("restored session: guild={guild_id}, channel={channel_id}");
         vec![Effect::LoadHistory { channel_id }]
@@ -1469,6 +1509,12 @@ impl App {
             self.status_error = None;
         }
 
+        if self
+            .desktop_notice
+            .is_some_and(|(_, at)| at.elapsed().as_secs() >= 5)
+        {
+            self.desktop_notice = None;
+        }
         self.tick_count = self.tick_count.wrapping_add(1);
         if self.has_sign_in() {
             return Vec::new();
@@ -2069,6 +2115,113 @@ impl App {
         self.summary_state.last_digest = Some(digest);
     }
 
+    fn can_act_on_messages(&self) -> bool {
+        self.focus == FocusPane::Messages
+            && self.message_pane_view == MessagePaneView::Messages
+            && !self.digest.visible
+    }
+
+    fn cursor_message_index(&self) -> Option<usize> {
+        let id = self.message_cursor.visible.as_ref()?;
+        self.messages.iter().position(|message| &message.id == id)
+    }
+
+    fn select_message(&mut self, older: bool) {
+        let Some(index) = self.cursor_message_index() else {
+            return;
+        };
+        let target = if older {
+            index.saturating_sub(1)
+        } else {
+            index.saturating_add(1)
+        };
+        let message = self.messages.get(target).or_else(|| self.messages.last());
+        self.message_cursor.selected = message.map(|message| message.id.clone());
+        self.message_cursor.reveal = true;
+        self.at_bottom = false;
+    }
+
+    fn copy_message(&mut self) -> Vec<Effect> {
+        let Some(message) = self
+            .cursor_message_index()
+            .and_then(|index| self.messages.get(index))
+        else {
+            self.set_error("No message to copy".into());
+            return Vec::new();
+        };
+        if message.content.trim().is_empty() {
+            self.set_error("This message has no text".into());
+            return Vec::new();
+        }
+        if message.content.len() > message_actions::MAX_MESSAGE_BYTES {
+            self.set_error("Message is too large to copy".into());
+            return Vec::new();
+        }
+        self.start_desktop_action(DesktopAction::Copy(message.content.clone()))
+    }
+
+    fn open_message_link(&mut self) -> Vec<Effect> {
+        let Some(message) = self
+            .cursor_message_index()
+            .and_then(|index| self.messages.get(index))
+        else {
+            self.set_error("No message selected".into());
+            return Vec::new();
+        };
+        let mut links = message_actions::links(&message.content);
+        match links.as_slice() {
+            [] => self.set_error("This message has no web links".into()),
+            [_] => {
+                return links.pop().map_or_else(Vec::new, |url| {
+                    self.start_desktop_action(DesktopAction::Open(url))
+                });
+            }
+            _ => {
+                self.link_picker = Some(LinkPicker {
+                    links,
+                    selected: 0,
+                    confirm_visible: false,
+                });
+            }
+        }
+        Vec::new()
+    }
+
+    fn update_link_picker(&mut self, action: &Action) -> Vec<Effect> {
+        let Some(picker) = self.link_picker.as_mut() else {
+            return Vec::new();
+        };
+        match action {
+            Action::MoveUp => picker.selected = picker.selected.saturating_sub(1),
+            Action::MoveDown => {
+                picker.selected = picker
+                    .selected
+                    .saturating_add(1)
+                    .min(picker.links.len().saturating_sub(1));
+            }
+            Action::ShowMessages => self.link_picker = None,
+            Action::OpenSelected if picker.confirm_visible => {
+                let url = picker.links.get(picker.selected).cloned();
+                self.link_picker = None;
+                if let Some(url) = url {
+                    return self.start_desktop_action(DesktopAction::Open(url));
+                }
+            }
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn start_desktop_action(&mut self, action: DesktopAction) -> Vec<Effect> {
+        if self.desktop_pending {
+            self.set_error("A clipboard or browser request is already running".into());
+            return Vec::new();
+        }
+        self.desktop_pending = true;
+        self.desktop_notice = None;
+        vec![Effect::Desktop(action)]
+    }
+
     fn move_selection(&mut self, delta: i32) {
         if self.digest.visible {
             self.digest.move_selection(if delta < 0 { -1 } else { 1 });
@@ -2145,10 +2298,14 @@ impl App {
                 }
             }
             FocusPane::Messages if to_top => {
+                self.message_cursor.selected = None;
                 self.message_scroll_offset = 0;
                 self.at_bottom = false;
             }
-            FocusPane::Messages => self.at_bottom = true,
+            FocusPane::Messages => {
+                self.message_cursor.selected = None;
+                self.at_bottom = true;
+            }
             _ => {}
         }
     }
@@ -2423,6 +2580,8 @@ impl App {
         self.selected_guild_id = Some(guild_id.clone());
         self.selected_channel_id = None;
         self.messages.clear();
+        self.message_cursor = MessageCursor::default();
+        self.link_picker = None;
         self.message_scroll_offset = 0;
         self.read_watermark = 0;
         self.unread_divider_anchor = None;
@@ -2498,6 +2657,8 @@ impl App {
 
         self.selected_channel_id = Some(channel_id.clone());
         self.messages.clear();
+        self.message_cursor = MessageCursor::default();
+        self.link_picker = None;
         self.message_scroll_offset = 0;
         self.read_watermark = 0;
         self.unread_divider_message_id = None;
@@ -2569,6 +2730,8 @@ impl App {
         if self.selected_channel_id.as_deref() == Some(channel_id.as_str()) {
             self.selected_channel_id = None;
             self.messages.clear();
+            self.message_cursor = MessageCursor::default();
+            self.link_picker = None;
             self.message_scroll_offset = 0;
             self.read_watermark = 0;
             self.unread_divider_anchor = None;

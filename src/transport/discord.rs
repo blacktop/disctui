@@ -6,6 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use diself::prelude::*;
 use serde::Deserialize;
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 
@@ -143,20 +144,32 @@ impl EventHandler for DiscordBridge {
         });
     }
 
-    async fn on_message_create(&self, ctx: &Context, message: Message) {
+    async fn on_message_create_event(&self, ctx: &Context, data: Value) {
+        let Some(message) = MessagePayload::from_gateway(data) else {
+            return;
+        };
         let channel_hint = ctx
             .cache
             .channel(&message.channel_id)
             .and_then(|channel| channel_to_summary(&channel));
-        let row = message_to_resolved_row(&ctx.http, &ctx.cache, &message, false).await;
+        let mut row = message.into_row("", false);
+        resolve_row_user_mentions(&ctx.http, &ctx.cache, &mut row).await;
         self.send(Action::MessageAppended {
             message: row,
             channel_hint,
         });
     }
 
-    async fn on_message_update(&self, ctx: &Context, message: Message) {
-        let mut row = message_to_resolved_row(&ctx.http, &ctx.cache, &message, false).await;
+    async fn on_message_update_event(&self, ctx: &Context, data: Value) {
+        // A partial update may omit the body. Keep the current row in that case.
+        if !data.get("content").is_some_and(Value::is_string) {
+            return;
+        }
+        let Some(message) = MessagePayload::from_gateway(data) else {
+            return;
+        };
+        let mut row = message.into_row("", false);
+        resolve_row_user_mentions(&ctx.http, &ctx.cache, &mut row).await;
         row.edited = true;
         self.send(Action::MessagePatched(row));
     }
@@ -211,12 +224,12 @@ impl EventHandler for DiscordBridge {
 /// The Gateway presents the client properties saved with `token`, when the
 /// session was created in the login `WebView`.
 pub fn connect(
-    token: String,
+    session: crate::auth::MessageSession,
     tx: mpsc::Sender<Action>,
 ) -> color_eyre::eyre::Result<(Arc<diself::Client>, tokio::task::JoinHandle<()>)> {
     let err_tx = tx.clone();
     let bridge = DiscordBridge::new(tx);
-    let client_properties = crate::auth::client_properties_for(&token);
+    let (token, client_properties) = session.into_parts();
     tracing::info!(
         "gateway identity: {}",
         if client_properties.is_some() {
@@ -256,50 +269,6 @@ pub fn connect(
     });
 
     Ok((client, handle))
-}
-
-pub fn message_to_row(msg: &Message, is_continuation: bool) -> MessageRow {
-    let timestamp = parse_discord_timestamp(&msg.timestamp);
-    let author =
-        preferred_user_name(&msg.author.username, msg.author.global_name.as_deref()).to_string();
-    let content = render_message_content(
-        &msg.content,
-        msg.mentions.iter().map(|mentioned_user| {
-            (
-                mentioned_user.id.as_str(),
-                preferred_user_name(
-                    &mentioned_user.username,
-                    mentioned_user.global_name.as_deref(),
-                ),
-            )
-        }),
-        msg.message_reference.is_some(),
-    );
-
-    MessageRow {
-        id: msg.id.clone(),
-        channel_id: msg.channel_id.clone(),
-        author,
-        author_avatar_url: user_avatar_url(&msg.author.id, msg.author.avatar.as_deref()),
-        content,
-        attachments: msg
-            .attachments
-            .iter()
-            .map(|attachment| {
-                attachment_summary(AttachmentSummaryInput {
-                    id: attachment.id.clone(),
-                    filename: attachment.filename.clone(),
-                    url: attachment.proxy_url.clone(),
-                    content_type: attachment.content_type.clone(),
-                    width: attachment.width,
-                    height: attachment.height,
-                })
-            })
-            .collect(),
-        timestamp,
-        edited: msg.edited_timestamp.is_some(),
-        is_continuation,
-    }
 }
 
 fn preferred_user_name<'a>(username: &'a str, global_name: Option<&'a str>) -> &'a str {
@@ -415,17 +384,6 @@ async fn resolve_user_names(
     resolved
 }
 
-async fn message_to_resolved_row(
-    http: &diself::HttpClient,
-    cache: &diself::Cache,
-    msg: &Message,
-    is_continuation: bool,
-) -> MessageRow {
-    let mut row = message_to_row(msg, is_continuation);
-    resolve_row_user_mentions(http, cache, &mut row).await;
-    row
-}
-
 pub async fn resolve_row_user_mentions(
     http: &diself::HttpClient,
     cache: &diself::Cache,
@@ -436,7 +394,14 @@ pub async fn resolve_row_user_mentions(
         return;
     }
 
-    let resolved = resolve_user_names(http, cache, unresolved_ids).await;
+    let Ok(resolved) = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        resolve_user_names(http, cache, unresolved_ids),
+    )
+    .await
+    else {
+        return;
+    };
     if resolved.is_empty() {
         return;
     }
@@ -828,28 +793,33 @@ fn channel_name(channel: &diself::Channel) -> String {
     "unnamed".to_string()
 }
 
-/// Convert messages from diself (newest-first from REST) to chronological order.
+// Shared by history and live messages. Opaque rich fields let the rest of a
+// message load even when Discord introduces a new card or component shape.
 #[derive(Debug, Deserialize)]
-struct HistoryMessagePayload {
+struct MessagePayload {
     id: String,
     #[serde(default)]
     channel_id: String,
-    author: HistoryUserPayload,
+    author: MessageUser,
     #[serde(default)]
     content: String,
     timestamp: String,
     #[serde(default)]
     edited_timestamp: Option<String>,
     #[serde(default)]
-    mentions: Vec<HistoryUserPayload>,
+    mentions: Vec<MessageUser>,
     #[serde(default)]
-    attachments: Vec<HistoryAttachmentPayload>,
+    attachments: Vec<MessageAttachment>,
+    #[serde(default)]
+    embeds: Value,
+    #[serde(default)]
+    components: Value,
     #[serde(default)]
     message_reference: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
-struct HistoryUserPayload {
+struct MessageUser {
     id: String,
     username: String,
     #[serde(default)]
@@ -859,7 +829,7 @@ struct HistoryUserPayload {
 }
 
 #[derive(Debug, Deserialize)]
-struct HistoryAttachmentPayload {
+struct MessageAttachment {
     id: String,
     filename: String,
     #[serde(default)]
@@ -897,69 +867,164 @@ pub fn ids_of_messages_mentioning(history: &serde_json::Value, user_id: &str) ->
         .collect()
 }
 
-pub fn history_rows_from_value(
-    requested_channel_id: &str,
-    value: serde_json::Value,
-) -> serde_json::Result<Vec<MessageRow>> {
-    let messages: Vec<HistoryMessagePayload> = serde_json::from_value(value)?;
-    let mut rows: Vec<MessageRow> = Vec::with_capacity(messages.len());
+const MAX_RICH_TEXT_BYTES: usize = 48_000;
+const MAX_COMPONENTS: usize = 128;
+const MAX_COMPONENT_DEPTH: usize = 8;
 
-    for msg in messages.into_iter().rev() {
-        let author = preferred_user_name(&msg.author.username, msg.author.global_name.as_deref())
-            .to_string();
-        let is_continuation = rows.last().is_some_and(|prev| prev.author == author);
+fn append_rich_block(out: &mut String, text: Option<&str>) {
+    let Some(text) = text.map(str::trim).filter(|text| !text.is_empty()) else {
+        return;
+    };
+    let space = MAX_RICH_TEXT_BYTES
+        .saturating_sub(out.len())
+        .saturating_sub(1);
+    let text = &text[..text.floor_char_boundary(space)];
+    if text.is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.extend(text.chars().map(|ch| {
+        if ch != '\n' && ch.is_control() {
+            ' '
+        } else {
+            ch
+        }
+    }));
+}
 
-        let content = render_message_content(
-            &msg.content,
-            msg.mentions.iter().map(|mentioned_user| {
-                (
-                    mentioned_user.id.as_str(),
-                    preferred_user_name(
-                        &mentioned_user.username,
-                        mentioned_user.global_name.as_deref(),
-                    ),
-                )
-            }),
-            msg.message_reference.is_some(),
-        );
+fn append_component_text(out: &mut String, components: &[Value], depth: usize, budget: &mut usize) {
+    if depth >= MAX_COMPONENT_DEPTH {
+        return;
+    }
+    for component in components {
+        if *budget == 0 {
+            break;
+        }
+        *budget -= 1;
+        if component.get("type").and_then(Value::as_u64) == Some(10) {
+            append_rich_block(out, component.get("content").and_then(Value::as_str));
+        }
+        if let Some(children) = component.get("components").and_then(Value::as_array) {
+            append_component_text(out, children, depth + 1, budget);
+        }
+    }
+}
 
-        let attachments = msg
-            .attachments
-            .into_iter()
-            .map(|attachment| {
-                let url = if attachment.proxy_url.is_empty() {
-                    attachment.url
-                } else {
-                    attachment.proxy_url
-                };
-                attachment_summary(AttachmentSummaryInput {
-                    id: attachment.id,
-                    filename: attachment.filename,
-                    url,
-                    content_type: attachment.content_type,
-                    width: attachment.width,
-                    height: attachment.height,
-                })
-            })
-            .collect();
-
-        rows.push(MessageRow {
-            id: msg.id,
-            channel_id: if msg.channel_id.is_empty() {
-                requested_channel_id.to_string()
-            } else {
-                msg.channel_id
-            },
-            author,
-            author_avatar_url: user_avatar_url(&msg.author.id, msg.author.avatar.as_deref()),
-            content,
-            attachments,
-            timestamp: parse_discord_timestamp(&msg.timestamp),
-            edited: msg.edited_timestamp.is_some(),
-            is_continuation,
-        });
+impl MessagePayload {
+    fn from_gateway(data: Value) -> Option<Self> {
+        let message: Self = serde_json::from_value(data).ok()?;
+        (!message.channel_id.is_empty()).then_some(message)
     }
 
+    fn rich_text(&self) -> String {
+        let mut out = String::new();
+        let mut budget = MAX_COMPONENTS;
+        let has_text = !self.content.trim().is_empty();
+        for embed in self.embeds.as_array().into_iter().flatten().take(10) {
+            let kind = embed.get("type").and_then(Value::as_str);
+            // Plain messages already show the link behind an automatic preview.
+            if has_text && !matches!(kind, None | Some("rich" | "components")) {
+                continue;
+            }
+            append_rich_block(&mut out, embed.get("title").and_then(Value::as_str));
+            append_rich_block(&mut out, embed.get("description").and_then(Value::as_str));
+            if let Some(fields) = embed.get("fields").and_then(Value::as_array) {
+                for field in fields.iter().take(25) {
+                    append_rich_block(&mut out, field.get("name").and_then(Value::as_str));
+                    append_rich_block(&mut out, field.get("value").and_then(Value::as_str));
+                }
+            }
+            if let Some(components) = embed.get("components").and_then(Value::as_array) {
+                append_component_text(&mut out, components, 0, &mut budget);
+            }
+        }
+        if let Some(components) = self.components.as_array() {
+            append_component_text(&mut out, components, 0, &mut budget);
+        }
+        out
+    }
+
+    fn into_row(mut self, requested_channel_id: &str, is_continuation: bool) -> MessageRow {
+        let rich_text = self.rich_text();
+        if !rich_text.trim().is_empty() {
+            if self.content.trim().is_empty() {
+                self.content.clear();
+            } else {
+                self.content.push_str("\n\n");
+            }
+            self.content.push_str(&rich_text);
+        } else if self.content.trim().is_empty()
+            && self.attachments.is_empty()
+            && [&self.embeds, &self.components]
+                .iter()
+                .any(|value| value.as_array().is_some_and(|items| !items.is_empty()))
+        {
+            self.content = "[Rich content]".into();
+        }
+        let content = render_message_content(
+            &self.content,
+            self.mentions.iter().map(|user| {
+                (
+                    user.id.as_str(),
+                    preferred_user_name(&user.username, user.global_name.as_deref()),
+                )
+            }),
+            self.message_reference.is_some(),
+        );
+
+        MessageRow {
+            id: self.id,
+            channel_id: if self.channel_id.is_empty() {
+                requested_channel_id.to_string()
+            } else {
+                self.channel_id
+            },
+            author: preferred_user_name(&self.author.username, self.author.global_name.as_deref())
+                .to_string(),
+            author_avatar_url: user_avatar_url(&self.author.id, self.author.avatar.as_deref()),
+            content,
+            attachments: self
+                .attachments
+                .into_iter()
+                .map(|attachment| {
+                    let url = if attachment.proxy_url.is_empty() {
+                        attachment.url
+                    } else {
+                        attachment.proxy_url
+                    };
+                    attachment_summary(AttachmentSummaryInput {
+                        id: attachment.id,
+                        filename: attachment.filename,
+                        url,
+                        content_type: attachment.content_type,
+                        width: attachment.width,
+                        height: attachment.height,
+                    })
+                })
+                .collect(),
+            timestamp: parse_discord_timestamp(&self.timestamp),
+            edited: self.edited_timestamp.is_some(),
+            is_continuation,
+        }
+    }
+}
+
+pub fn history_rows_from_value(
+    requested_channel_id: &str,
+    value: Value,
+) -> serde_json::Result<Vec<MessageRow>> {
+    let messages: Vec<MessagePayload> = serde_json::from_value(value)?;
+    let mut rows: Vec<MessageRow> = Vec::with_capacity(messages.len());
+    for message in messages.into_iter().rev() {
+        let author = preferred_user_name(
+            &message.author.username,
+            message.author.global_name.as_deref(),
+        );
+        let is_continuation = rows.last().is_some_and(|prev| prev.author == author);
+        rows.push(message.into_row(requested_channel_id, is_continuation));
+    }
     Ok(rows)
 }
 
@@ -1016,6 +1081,29 @@ mod tests {
             replace_user_mentions("hi <@123> and <@!456>", [("123", "alice"), ("456", "bob")]);
 
         assert_eq!(rendered, "hi @alice and @bob");
+    }
+
+    #[test]
+    fn plain_link_preview_stays_compact_and_rich_text_strips_control_characters() {
+        let payload = serde_json::json!({
+            "id": "1",
+            "channel_id": "10",
+            "author": {"id": "20", "username": "release-bot"},
+            "content": "Read https://example.com",
+            "timestamp": "2026-11-25T03:47:00Z",
+            "embeds": [
+                {"type": "link", "title": "Automatic preview"},
+                {"type": "rich", "description": "Ready\u{001b}]0;title\u{0007}"}
+            ],
+            "components": null
+        });
+        let Some(message) = MessagePayload::from_gateway(payload) else {
+            unreachable!("fixture should decode as a live message");
+        };
+        assert_eq!(
+            message.into_row("", false).content,
+            "Read https://example.com\n\nReady ]0;title "
+        );
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub struct Footer {
     connection: ConnectionState,
     username: String,
     error: Option<String>,
+    notice: Option<&'static str>,
 }
 
 impl Footer {
@@ -32,6 +33,7 @@ impl Footer {
             connection: app.connection_state,
             username: app.current_username.clone(),
             error: app.status_error().map(str::to_string),
+            notice: app.desktop_notice(),
         }
     }
 
@@ -84,15 +86,22 @@ impl Footer {
                 vec![("j/k", "item"), ("enter", "jump"), ("m", "messages")]
             }
             (InputMode::Normal, FocusPane::Messages | FocusPane::Input) => {
-                vec![("j/k", "scroll"), ("i", "write"), ("s", "summarize")]
+                vec![
+                    ("j/k", "scroll"),
+                    ("J/K", "message"),
+                    ("c", "copy"),
+                    ("o", "link"),
+                    ("i", "write"),
+                    ("s", "summarize"),
+                ]
             }
         };
         // Least important last: hints are dropped from the end when space runs out.
         hints.extend([("?", "help"), ("q", "quit"), ("tab", "pane")]);
         match self.connection {
-            ConnectionState::Disconnected => hints.insert(0, ("c", "retry connection")),
+            ConnectionState::Disconnected => hints.insert(0, ("C", "retry connection")),
             ConnectionState::MockTransport => {
-                hints.push(("c", "connect"));
+                hints.push(("C", "connect"));
             }
             ConnectionState::Connected
             | ConnectionState::SessionExpired
@@ -107,6 +116,10 @@ impl Footer {
         let mut spans = vec![self.mode_chip(), Span::raw(" ")];
         if let Some(error) = &self.error {
             spans.push(Span::styled(error.clone(), theme::error()));
+            return Line::from(spans);
+        }
+        if let Some(notice) = self.notice {
+            spans.push(Span::styled(notice, theme::success()));
             return Line::from(spans);
         }
         let mut used: usize = spans.iter().map(Span::width).sum();
@@ -178,6 +191,7 @@ mod tests {
             connection,
             username: "ferris".into(),
             error: None,
+            notice: None,
         }
     }
 
@@ -227,14 +241,14 @@ mod tests {
             FocusPane::Messages,
             ConnectionState::Connected,
         );
-        assert!(!text(&online.left(200)).contains("c connect"));
+        assert!(!text(&online.left(200)).contains("C connect"));
 
         let offline = footer(
             InputMode::Normal,
             FocusPane::Messages,
             ConnectionState::Disconnected,
         );
-        assert!(text(&offline.left(200)).contains("c retry connection"));
+        assert!(text(&offline.left(200)).contains("C retry connection"));
         assert!(text(&offline.right()).contains("disconnected"));
     }
 
@@ -247,9 +261,9 @@ mod tests {
         );
         let narrow = text(&footer.left(45));
         assert!(narrow.len() <= 45, "{narrow:?}");
-        assert!(narrow.contains("c retry connection"));
+        assert!(narrow.contains("C retry connection"));
         assert!(!narrow.contains("? help"));
-        assert!(!narrow.contains("c connect"));
+        assert!(!narrow.contains("C connect"));
         assert!(narrow.ends_with("  "), "no partial hint: {narrow:?}");
 
         assert_eq!(text(&footer.left(0)), " NORMAL  ");

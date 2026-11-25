@@ -76,6 +76,8 @@ just release v0.2.0   # release the version already in Cargo.toml
 
 Pushing a signed `vX.Y.Z` tag runs the release workflow, which builds both macOS architectures with GoReleaser and updates the Homebrew cask.
 
+To act on a message, focus the message pane with `3` and select it with `Shift+J` or `Shift+K`. On macOS, press `c` to copy the full text or `o` to open a web link. If there are several links, use `j` or `k` and Enter to choose one. Use `Shift+C` to connect or reconnect.
+
 ## Auth
 
 disctui has two kinds of sign-in, and they do different jobs.
@@ -105,12 +107,12 @@ The sign-in window runs as a child process of the running binary, because the ma
 
 `b` at the same prompt opens the browser account flow instead, which shows your name and servers but reads no channels or DMs. It is the only path that can use a Discord passkey, since a passkey needs Discord's own browser context.
 
-A session created in that window belongs to the client that created it. disctui saves the client properties Discord's page reported next to the session in Keychain (`account=discord_client_properties`) and presents them again when it connects to the Gateway. Discord revokes the session within seconds when a different client identity connects with it, so quit any older disctui build before signing in; an older build reading the same Keychain entry ends the session for every client.
+disctui stores the session and its client metadata together in one macOS Keychain record. On upgrade, disctui migrates older entries after verifying the new record, so the first launch may still ask for access to both old items. Quit older disctui builds before signing in, because they can invalidate the session.
 
 disctui looks for a Discord user token in this order:
 
 1. `DISCTUI_TOKEN`
-2. macOS Keychain entry `service=disctui`, `account=discord_token`
+2. macOS Keychain entry `service=disctui`, `account=discord_session`
 3. the sign-in prompt
 
 At the prompt, press `t` to paste one. disctui saves it in the Keychain and connects.

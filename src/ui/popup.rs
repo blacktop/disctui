@@ -49,6 +49,8 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
     (
         "Read and write",
         &[
+            ("J / K", "Select newer / older message"),
+            ("c / o", "Copy message text / open a web link"),
             ("i", "Write a message (esc when done)"),
             ("s", "Summarize unread messages"),
             ("m", "Back to messages"),
@@ -60,7 +62,7 @@ const HELP_SECTIONS: [(&str, &[(&str, &str)]); 4] = [
     (
         "Session",
         &[
-            ("c", "Connect or reconnect"),
+            ("Shift+C", "Connect or reconnect"),
             ("?", "Toggle this help"),
             ("q", "Quit (ctrl+c also works)"),
         ],
@@ -123,6 +125,38 @@ fn render_popup(
 /// Render the help overlay as a centered popup.
 pub fn render_help(frame: &mut Frame, area: Rect) {
     render_popup(frame, area, 52, "Keys", help_lines());
+}
+
+pub fn render_link_picker(
+    frame: &mut Frame,
+    area: Rect,
+    picker: &mut crate::message_actions::LinkPicker,
+) {
+    picker.confirm_visible = area.height >= 4 && area.width >= 20;
+    if !picker.confirm_visible {
+        frame.render_widget(Clear, area);
+        frame.render_widget(Paragraph::new("Resize to choose a link"), area);
+        return;
+    }
+    let shown = usize::from(area.height.saturating_sub(3)).min(10);
+    let first = picker.selected.saturating_sub(shown.saturating_sub(1));
+    let mut lines: Vec<_> = picker
+        .links
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(shown)
+        .map(|(index, url)| {
+            let (marker, style) = if index == picker.selected {
+                ("›", theme::selected_item())
+            } else {
+                (" ", theme::dim())
+            };
+            Line::styled(format!("{marker} {url}"), style)
+        })
+        .collect();
+    lines.push(Line::from("j/k select · Enter open · Esc cancel"));
+    render_popup(frame, area, 90, "Open link", lines);
 }
 
 fn key_hint(key: &'static str, label: &'static str) -> [Span<'static>; 2] {
