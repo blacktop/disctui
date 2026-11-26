@@ -50,4 +50,4 @@ jobs:
         run: just release-publish
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
